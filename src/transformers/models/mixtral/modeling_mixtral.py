@@ -72,11 +72,13 @@ import torch_xla.debug.profiler as xp
 import torch_xla.distributed.spmd as xs
 import torch_xla.core.xla_model as xm
 import torch_xla
+import os
 
 
 logger = logging.get_logger(__name__)
 
 _CONFIG_FOR_DOC = "MixtralConfig"
+SINGLE_SLICE = os.environ.get('SINGLE_SLICE', None)
 
 
 def load_balancing_loss_func(
@@ -1005,11 +1007,19 @@ class Gmm(torch.autograd.Function):
 
         # Enter manual sharding zone
         if xs.get_global_mesh() is not None:
-            hidden_states = xs.enable_manual_sharding(hidden_states, ('fsdp', None)).global_tensor
-            top_ks = xs.enable_manual_sharding(top_ks, ('fsdp', None)).global_tensor
-            w1 = xs.enable_manual_sharding(full_w1, (None, None, 'tensor')).global_tensor
-            w2 = xs.enable_manual_sharding(full_w2, (None, 'tensor', None)).global_tensor
-            w3 = xs.enable_manual_sharding(full_w3, (None, None, 'tensor')).global_tensor
+            if SINGLE_SLICE:
+                hidden_states = xs.enable_manual_sharding(hidden_states, ('fsdp', None)).global_tensor
+                top_ks = xs.enable_manual_sharding(top_ks, ('fsdp', None)).global_tensor
+                w1 = xs.enable_manual_sharding(full_w1, (None, None, 'tensor')).global_tensor
+                w2 = xs.enable_manual_sharding(full_w2, (None, 'tensor', None)).global_tensor
+                w3 = xs.enable_manual_sharding(full_w3, (None, None, 'tensor')).global_tensor
+            else:
+                hidden_states = xs.enable_manual_sharding(hidden_states, (('dcn', 'fsdp'), None)).global_tensor
+                top_ks = xs.enable_manual_sharding(top_ks, (('dcn', 'fsdp'), None)).global_tensor
+                w1 = xs.enable_manual_sharding(full_w1, (None, None, 'tensor')).global_tensor
+                w2 = xs.enable_manual_sharding(full_w2, (None, 'tensor', None)).global_tensor
+                w3 = xs.enable_manual_sharding(full_w3, (None, None, 'tensor')).global_tensor
+        
 
         # We want to create one big batch of tokens that has all top-k choices in it.
         # Our tokens will thus be duplicated k-times in the batch. To do this we,
