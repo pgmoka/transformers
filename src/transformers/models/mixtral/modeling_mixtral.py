@@ -1063,15 +1063,21 @@ class Gmm(torch.autograd.Function):
                 # Only reduce-scatter along tensor axis.
                 current_hidden_states = torch_xla.torch_xla._XLAC._xla_spmd_reduce_scatter(xm.REDUCE_SUM, current_hidden_states, 1.0, -1, device_ids.shape[-1], device_ids.tolist())
 
-
-            current_hidden_states = xs.disable_manual_sharding(current_hidden_states, ('fsdp', None, 'tensor'), (m, k, n)).global_tensor
-
-            # Checkpoints for backward
-            hidden_states_sorted = xs.disable_manual_sharding(hidden_states_sorted, ('fsdp', None), (m * k, n)).global_tensor
-            gmm1 = xs.disable_manual_sharding(gmm1, ('fsdp', 'tensor'), (m * k, l)).global_tensor
-            gmm3 = xs.disable_manual_sharding(gmm3, ('fsdp', 'tensor'), (m * k, l)).global_tensor
-            silu = xs.disable_manual_sharding(silu, ('fsdp', 'tensor'), (m * k, l)).global_tensor
-            sgmm = xs.disable_manual_sharding(sgmm, ('fsdp', 'tensor'), (m * k, l)).global_tensor
+            if SINGLE_SLICE:
+                current_hidden_states = xs.disable_manual_sharding(current_hidden_states, ('fsdp', None, 'tensor'), (m, k, n)).global_tensor
+                hidden_states_sorted = xs.disable_manual_sharding(hidden_states_sorted, ('fsdp', None), (m * k, n)).global_tensor
+                gmm1 = xs.disable_manual_sharding(gmm1, ('fsdp', 'tensor'), (m * k, l)).global_tensor
+                gmm3 = xs.disable_manual_sharding(gmm3, ('fsdp', 'tensor'), (m * k, l)).global_tensor
+                silu = xs.disable_manual_sharding(silu, ('fsdp', 'tensor'), (m * k, l)).global_tensor
+                sgmm = xs.disable_manual_sharding(sgmm, ('fsdp', 'tensor'), (m * k, l)).global_tensor
+            else:
+                current_hidden_states = xs.disable_manual_sharding(current_hidden_states, (('dcn','fsdp'), None, 'tensor'), (m, k, n)).global_tensor
+                # Checkpoints for backward
+                hidden_states_sorted = xs.disable_manual_sharding(hidden_states_sorted, (('dcn', 'fsdp'), None), (m * k, n)).global_tensor
+                gmm1 = xs.disable_manual_sharding(gmm1, (('dcn', 'fsdp'), 'tensor'), (m * k, l)).global_tensor
+                gmm3 = xs.disable_manual_sharding(gmm3, (('dcn', 'fsdp'), 'tensor'), (m * k, l)).global_tensor
+                silu = xs.disable_manual_sharding(silu, (('dcn', 'fsdp'), 'tensor'), (m * k, l)).global_tensor
+                sgmm = xs.disable_manual_sharding(sgmm, (('dcn', 'fsdp'), 'tensor'), (m * k, l)).global_tensor
 
         # Save for backward
         ctx.save_for_backward(hidden_states_sorted, full_w1, full_w2, full_w3, gmm1, gmm3, silu, sgmm, hidden_states_order, hidden_states_reverse_order, group_sizes)
@@ -1102,15 +1108,23 @@ class Gmm(torch.autograd.Function):
 
         # Enter manual sharding zone
         if xs.get_global_mesh() is not None:
-            hidden_states_sorted = xs.enable_manual_sharding(hidden_states_sorted, ('fsdp', None)).global_tensor
+            if SINGLE_SLICE:
+                hidden_states_sorted = xs.enable_manual_sharding(hidden_states_sorted, ('fsdp', None)).global_tensor
+            else:
+                hidden_states_sorted = xs.enable_manual_sharding(hidden_states_sorted, (('dcn', 'fsdp'), None)).global_tensor
             w1 = xs.enable_manual_sharding(full_w1, (None, None, 'tensor')).global_tensor
             w2 = xs.enable_manual_sharding(full_w2, (None, 'tensor', None)).global_tensor
             w3 = xs.enable_manual_sharding(full_w3, (None, None, 'tensor')).global_tensor
-            gmm1 = xs.enable_manual_sharding(gmm1, ('fsdp', 'tensor')).global_tensor
-            gmm3 = xs.enable_manual_sharding(gmm3, ('fsdp', 'tensor')).global_tensor
-            silu = xs.enable_manual_sharding(silu, ('fsdp', 'tensor')).global_tensor
-            sgmm = xs.enable_manual_sharding(sgmm, ('fsdp', 'tensor')).global_tensor
-            grad_output = xs.enable_manual_sharding(grad_output, ('fsdp', None, None)).global_tensor
+            temp_sharding_spec = ('fsdp', 'tensor') if SINGLE_SLICE else (('dcn', 'fsdp'), 'tensor')
+            gmm1 = xs.enable_manual_sharding(gmm1, temp_sharding_spec).global_tensor
+            gmm3 = xs.enable_manual_sharding(gmm3, temp_sharding_spec).global_tensor
+            silu = xs.enable_manual_sharding(silu, temp_sharding_spec).global_tensor
+            sgmm = xs.enable_manual_sharding(sgmm, temp_sharding_spec).global_tensor
+            if SINGLE_SLICE:
+                grad_output = xs.enable_manual_sharding(grad_output, ('fsdp', None, None)).global_tensor
+            else:
+                grad_output = xs.enable_manual_sharding(grad_output, (('dcn', 'fsdp'), None, None)).global_tensor
+
 
         grad_output_sorted = grad_output.reshape(-1, n)[hidden_states_order]
         grad_output, grad_w2 = Gmm.gmm_backward_no_jax_gate2(grad_output_sorted, sgmm, w2, group_sizes)
@@ -1141,11 +1155,19 @@ class Gmm(torch.autograd.Function):
                 grad_w2 = torch_xla.torch_xla._XLAC._xla_spmd_reduce_scatter(xm.REDUCE_SUM, grad_w2, 1 / world_size, -2, world_size, groups)
                 grad_w3 = torch_xla.torch_xla._XLAC._xla_spmd_reduce_scatter(xm.REDUCE_SUM, grad_w3, 1 / world_size, -1, world_size, groups)
 
-                grad_output = xs.disable_manual_sharding(grad_output, (0, None), (m, n)).global_tensor
+                if SINGLE_SLICE:
+                    grad_output = xs.disable_manual_sharding(grad_output, ('fsdp', None), (m, n)).global_tensor
+                else:
+                    grad_output = xs.disable_manual_sharding(grad_output, (('dcn', 'fsdp'), None), (m, n)).global_tensor
                 # TODO: make the 0s more programmatic.
-                grad_w1 = xs.disable_manual_sharding(grad_w1, (None, None, 0), w1.shape).global_tensor
-                grad_w2 = xs.disable_manual_sharding(grad_w2, (None, 0, None), w2.shape).global_tensor
-                grad_w3 = xs.disable_manual_sharding(grad_w3, (None, None, 0), w3.shape).global_tensor
+                if SINGLE_SLICE:
+                    grad_w1 = xs.disable_manual_sharding(grad_w1, (None, None, 'fsdp'), w1.shape).global_tensor
+                    grad_w2 = xs.disable_manual_sharding(grad_w2, (None, 'fsdp', None), w2.shape).global_tensor
+                    grad_w3 = xs.disable_manual_sharding(grad_w3, (None, None, 'fsdp'), w3.shape).global_tensor
+                else:
+                    grad_w1 = xs.disable_manual_sharding(grad_w1, (None, None, ('dcn', 'fsdp')), w1.shape).global_tensor
+                    grad_w2 = xs.disable_manual_sharding(grad_w2, (None, ('dcn', 'fsdp'), None), w2.shape).global_tensor
+                    grad_w3 = xs.disable_manual_sharding(grad_w3, (None, None, ('dcn', 'fsdp')), w3.shape).global_tensor
             else:  # 2d sharding
                 device_ids = ctx.device_ids
 
