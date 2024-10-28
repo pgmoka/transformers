@@ -1144,12 +1144,12 @@ class Gmm(torch.autograd.Function):
 
         grad_output = grad_output[hidden_states_reverse_order]
         grad_output = grad_output.reshape(-1, k, grad_output.shape[-1]).sum(dim=1)
-
         # Exit manual sharding zone
         if xs.get_global_mesh() is not None:
             if not hasattr(ctx, "device_ids"):
                 # Here we do a manual reduce scatter as SPMD will not be able to infer this after the manual sharding zone.
-                groups = [xs.get_global_mesh().device_ids]  # a single group across the whole world
+                # groups = [xs.get_global_mesh().device_ids]  # a single group across the whole world
+                groups = [list(range(0, 256)), list(range(256, 512))]
                 world_size = len(groups[0])
                 grad_w1 = torch_xla.torch_xla._XLAC._xla_spmd_reduce_scatter(xm.REDUCE_SUM, grad_w1, 1 / world_size, -1, world_size, groups)
                 grad_w2 = torch_xla.torch_xla._XLAC._xla_spmd_reduce_scatter(xm.REDUCE_SUM, grad_w2, 1 / world_size, -2, world_size, groups)
@@ -1165,9 +1165,9 @@ class Gmm(torch.autograd.Function):
                     grad_w2 = xs.disable_manual_sharding(grad_w2, (None, 'fsdp', None), w2.shape).global_tensor
                     grad_w3 = xs.disable_manual_sharding(grad_w3, (None, None, 'fsdp'), w3.shape).global_tensor
                 else:
-                    grad_w1 = xs.disable_manual_sharding(grad_w1, (None, None, ('dcn', 'fsdp')), w1.shape).global_tensor
-                    grad_w2 = xs.disable_manual_sharding(grad_w2, (None, ('dcn', 'fsdp'), None), w2.shape).global_tensor
-                    grad_w3 = xs.disable_manual_sharding(grad_w3, (None, None, ('dcn', 'fsdp')), w3.shape).global_tensor
+                    grad_w1 = xs.disable_manual_sharding(grad_w1, (None, None,  'fsdp'), w1.shape).global_tensor
+                    grad_w2 = xs.disable_manual_sharding(grad_w2, (None,  'fsdp', None), w2.shape).global_tensor
+                    grad_w3 = xs.disable_manual_sharding(grad_w3, (None, None, 'fsdp'), w3.shape).global_tensor
             else:  # 2d sharding
                 device_ids = ctx.device_ids
 
