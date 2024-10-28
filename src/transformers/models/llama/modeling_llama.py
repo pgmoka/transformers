@@ -868,6 +868,8 @@ class LlamaModel(LlamaPreTrainedModel):
         # Initialize weights and apply final processing
         self.post_init()
 
+        logger.warning_once("NOTE: Activation host offloading features is unavailable on this model.")
+
     def get_input_embeddings(self):
         return self.embed_tokens
 
