@@ -476,18 +476,37 @@ def main():
     if len(tokenizer) > embedding_size:
         model.resize_token_embeddings(len(tokenizer))
 
+    # Check if we are running in multi-slice mode.
+    device_attributes = xr.global_runtime_device_attributes()
+    is_single_slice = 'slice_index' not in device_attributes[0]
+    is_multi_slice = not is_single_slice
+
+    if is_multi_slice and model_args.spmd_2d_sharding == 0:
+        raise ValueError("Multi-slice training requires SPMD 2D sharding")
+
     # Apply 2D sharding.
     # We apply sharding annotations before running the tokenizer, since
     # `training_args.main_process_first` may involve a `mark_step` which will materialize the
     # model on device.
     if model_args.spmd_2d_sharding > 0:
         num_devices = xr.global_runtime_device_count()
-        tensor_axis = model_args.spmd_2d_sharding
-        fsdp_axis = num_devices // tensor_axis
-        mesh_shape = (fsdp_axis, tensor_axis)
-        spmd_mesh = xs.Mesh(range(num_devices), mesh_shape, ('fsdp', 'tensor'))
+        if is_single_slice:
+            # Single-slice 2D sharding
+            tensor_axis = model_args.spmd_2d_sharding
+            fsdp_axis = num_devices // tensor_axis
+            mesh_shape = (fsdp_axis, tensor_axis)
+            spmd_mesh = xs.Mesh(range(num_devices), mesh_shape, ('fsdp', 'tensor'))
+        else:
+            # Multi-slice 2D sharding
+            dcn_axis = 2
+            tensor_axis = model_args.spmd_2d_sharding
+            fsdp_axis = num_devices // tensor_axis // dcn_axis
+            ici_mesh_shape = (fsdp_axis, tensor_axis)
+            dcn_mesh_shape = (dcn_axis, 1)
+            spmd_mesh = xs.HybridMesh(ici_mesh_shape=ici_mesh_shape, dcn_mesh_shape=dcn_mesh_shape, axis_names=('fsdp', 'tensor'))
         xs.set_global_mesh(spmd_mesh)
 
+        # Apply sharding annotations.
         model.to("xla")
         for name, param in model.named_parameters():
             print('> [2D] Sharding tensor', name, param.shape)
