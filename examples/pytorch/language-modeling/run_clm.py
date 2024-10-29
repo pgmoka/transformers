@@ -495,6 +495,7 @@ def main():
             tensor_axis = model_args.spmd_2d_sharding
             fsdp_axis = num_devices // tensor_axis
             mesh_shape = (fsdp_axis, tensor_axis)
+            logger.info(f"Single-slice sharding: mesh={mesh_shape}")
             spmd_mesh = xs.Mesh(range(num_devices), mesh_shape, ('fsdp', 'tensor'))
         else:
             # Multi-slice 2D sharding
@@ -503,6 +504,7 @@ def main():
             fsdp_axis = num_devices // tensor_axis // dcn_axis
             ici_mesh_shape = (fsdp_axis, tensor_axis)
             dcn_mesh_shape = (dcn_axis, 1)
+            logger.info(f"Multi-slice sharding: ici={ici_mesh_shape}, dcn={dcn_mesh_shape}")
             spmd_mesh = xs.HybridMesh(ici_mesh_shape=ici_mesh_shape, dcn_mesh_shape=dcn_mesh_shape, axis_names=('fsdp', 'tensor'))
         xs.set_global_mesh(spmd_mesh)
 
