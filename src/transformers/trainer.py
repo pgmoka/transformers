@@ -1813,6 +1813,7 @@ class Trainer:
         args = self.args
 
         self.is_in_train = True
+        os.environ['USE_SINGLE_SLICE']= 'true'
 
         # Attach NEFTune hooks if necessary
         if self.neftune_noise_alpha is not None:

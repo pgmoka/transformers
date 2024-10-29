@@ -1279,7 +1279,6 @@ class Gmm(torch.autograd.Function):
     @xp.trace_me("gmm_backward")
     def backward(ctx, grad_output):
         from torch_xla.experimental.custom_kernel import _histogram, gmm_backward
-
         device = grad_output.device
         if device == torch.device('cpu'):
             gmm_backward = Gmm._eager_gmm_backward
@@ -1377,7 +1376,6 @@ class Gmm(torch.autograd.Function):
                 grad_w1 = xs.disable_manual_sharding(grad_w1, (None, 'fsdp', 'tensor'), full_w1.shape).global_tensor
                 grad_w2 = xs.disable_manual_sharding(grad_w2, (None, 'tensor', 'fsdp'), full_w2.shape).global_tensor
                 grad_w3 = xs.disable_manual_sharding(grad_w3, (None, 'fsdp', 'tensor'), full_w3.shape).global_tensor
-
         return grad_output, None, grad_w1, grad_w2, grad_w3
 
 
