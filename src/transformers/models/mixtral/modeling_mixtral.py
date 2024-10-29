@@ -397,8 +397,12 @@ class MixtralAttention(nn.Module):
             query_states /= math.sqrt(self.head_dim)
             partition_spec = None
             if xs.get_global_mesh() is not None:
-                partition_spec = ('fsdp', 'tensor', None, None)
+                if SINGLE_SLICE:
+                    partition_spec = ('fsdp', 'tensor', None, None)
+                else:
+                    partition_spec = (('dcn','fsdp'), 'tensor', None, None)
             attn_output = flash_attention(query_states, key_states, value_states, causal=True, partition_spec=partition_spec)
+            # attn_output = FlashAttention.apply(query_states, key_states, value_states, True, None, None, 1.0, None, partition_spec, None)
 
         if attn_output.size() != (bsz, self.num_heads, q_len, self.head_dim):
             raise ValueError(
@@ -834,6 +838,191 @@ class MixtralBLockSparseTop2MLP(MixtralBlockSparseTop2MLP):
         super().__init__(*args, **kwargs)
 
 
+class FlashAttention(torch.autograd.Function):
+  """
+  This is a simplified wrapper on top of https://github.com/google/jax/blob/b2058d72b7e1693a41303d5411572aabf99b7981/jax/experimental/pallas/ops/tpu/flash_attention.py#L139
+  where we only takes q, k, v and causal as input and set block_sizes for the users.
+  """
+
+  MIN_BLOCK_SIZE = 128
+  DEFAULT_MASK_VALUE = -0.7 * float(torch.finfo(torch.float32).max)
+  # The block_sizes configuration is copied from https://github.com/google/maxtext/blob/0fee320451738166c8e596dc63a57a4673671576/MaxText/layers/attentions.py#L215-L240
+  # It yields much better performance than the default block_sizes.
+  DEFAULT_BLOCK_SIZES = {
+      "block_q": 512,
+      "block_k_major": 512,
+      "block_k": 512,
+      "block_b": 2,
+      "block_q_major_dkv": 512,
+      "block_k_major_dkv": 512,
+      "block_q_dkv": 512,
+      "block_k_dkv": 512,
+      "block_q_dq": 1024,
+      "block_k_dq": 256,
+      "block_k_major_dq": 512,
+  }
+  NUM_LANES = 128
+  NUM_SUBLANES = 8
+
+  @staticmethod
+  def forward(ctx, q, k, v, causal, q_segment_ids, kv_segment_ids, sm_scale, ab,
+              partition_spec, mesh):
+
+    ctx.causal = causal
+    ctx.sm_scale = sm_scale
+    ctx.partition_spec = partition_spec
+    ctx.mesh = mesh
+    ctx.full_shape = None
+    save_residuals = q.requires_grad or k.requires_grad or v.requires_grad
+
+    # SPMD integration.
+    # mark_sharding is in-placed, and therefore save the full q, k, v for the backward.
+    full_q = q
+    full_k = k
+    full_v = v
+    full_ab = ab
+    if partition_spec is not None:
+      ctx.full_shape = q.shape
+      q = xs.enable_manual_sharding(q, partition_spec, mesh=mesh).global_tensor
+      k = xs.enable_manual_sharding(k, partition_spec, mesh=mesh).global_tensor
+      v = xs.enable_manual_sharding(v, partition_spec, mesh=mesh).global_tensor
+      if ab:
+        ab = xs.enable_manual_sharding(
+            ab, partition_spec, mesh=mesh).global_tensor
+
+    # It computes the shape and type of o, l, m.
+    shapes = [q.shape]
+    dtypes = [q.dtype]
+    if save_residuals:
+      res_shape = list(q.shape)
+      res_shape[-1] = FlashAttention.MIN_BLOCK_SIZE
+      for _ in range(2):
+        shapes.append(res_shape)
+        dtypes.append(torch.float32)
+
+    with torch.no_grad():
+      segment_ids, q_segment_ids, kv_segment_ids = None, None, None
+      ctx.segment_ids = segment_ids
+
+      # We can't directly use flash_attention as we need to override the save_residuals flag which returns
+      # l and m that is needed for the backward. Then we lose all the shape checks.
+      # TODO: replicate the shape checks on flash_attention.
+      # Here we seperate the tracing and execution part just to support SegmentIds.
+      payload = "{\"custom_call_config\": {\"body\": \"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Aw0FHyEbFFEDIwkDN30DA80uAwMJCQbNAwUDhwMDHwEDAwMDHwEDAwMDHwEDAwMDHwEDAwcGHwMHCxGLjY+RBQYfAwUDkwUGHwMHA4kNBB8NlxGLjY+RAwPPRQMJCQbPAwUDmQMDIQEDAwMDIQEDAwMDIQEDAwMDIQEDAwcGIQMHCxOdn6GjBQYhAwUDpQUGIQMHA5sNBCENqROdn6GjAwPRRQMJCQbRAwUDqwMDIwEDAwMDIwEDAwMDIwEDAwMDIwEDAwcGIwMHCxWvsbO1BQYjAwUDtwUGIwMHA60NBCMNuxWvsbO1EQBGAwMBBREARgMDA50RAwETB50JAwEFBSUDAz8nAwEPBz8JAwEFJykDA6MRAwElB6MJAwEFKy0DAz8nAwEPBz8JAwEFBzEDA1URAwEDA1UHAwELB1WVAw0FLzMZBi4CAwEDOQMDVwcDAQsHV1MDDQU7PRsUVwM/CQMKAjoEAwOnBwMBAwMrAQMDAwMrAQMDAwMrAQMDAwMrAQMDBwYrAwcLEYmLjY8FBisDBQORAwMtAQMDAwMtAQMDAwMtAQMDAwMtAQMDBwYtAwcLE5WXmZsFBi0DBQOdAwMvAQMDAwMvAQMDAwMvAQMDAwMvAQMDBwYvAxMLCaGjpacFBi8DEQOpAwOpJwMBDwepCQMBBYetAwMxAQMDAwMxAQMDKQYxAwMDrwMDMQEDAwcGMQMTCwuxs7W3BQYxAxEDuQMDq1YCAwsrB6teAgMLB6u7vS0DbgJqAgMPAwOvJwMBDwevCQMBBQXDCQaxAw8DxRMHsQkDDwXBxy0DfgJ6AgMPAwOzJwMBDwezCQMBBQfNEwdfCQMBBc+vCQZfAw8D0RMHXwkDDwXL0wMDYREDAQMDYQcDAQsHYYYCAyEF1ckDA7VFAwkDA7WOAgMJCQa5AwsD3QkGuQMLA98XBpICAwsH2+HjHQeaAg8DCwW/5QMDu54CAxUvB7umAgMVBefpBQa2AgMfA+sJBr0DBQPtNQe9DwMFBZPvHwfCAroCAwsD8TEHxgIPAwsF5/MzB8oCDwMLA/UxB9ICDwMFBZPxMwfaAg8DBQP5FQfeAg8DBQX7nwMDv+ICAxUvB7/mAgMVBff/BQbqAgMfAwICCQbBAwUDBgIdB8EPAwUFCgL9AwMXAQMDAwMXAQMDAwMXAQMDAwMXAQMDBwYXAwcLExICFgIaAh4CBQYXAwUDIgIFBhcDBwMOAg0EFw0qAhMSAhYCGgIeAgMDGQEDAwMDGQEDAwMDGQEDAwMDGQEDAwcGGQMHCxEuAjICNgI6AgUGGQMFAz4CBQYZAwcD8Q0EGQ1GAhEuAjICNgI6AgMDY0UDCQkGYwMFA0oCNwdj7gIDIwUOAk4CAwNlwwMJCQZlAwUDVgI5B2UPAwUFWgIOAgMD8gLDAwkJBvYCAwUDYgIXBvoCAwUHUgJmAl4CAwMzAQMDAwMzAQMDAwMzAQMDAwMzAQMDBwYzAwcLFW4CcgJ2AnoCBQYzAwUDfgIVB8UPAwUF/WoCHwcCA8cDBQOGAhUHxQ8DBQWCAooCAwMbAQMDAwMbAQMDAwMbAQMDAwMbAQMDBwYbAwcLFZIClgKaAp4CBQYbAwUDogIFBhsDBwOOAg0EGw2qAhWSApYCmgKeAgMDNQEDAwMDNQEDAykGNQMDA68DAzUBAwMHBjUDEwsNrgKyArYCugIFBjUDEQO+AicGDgMDJQP3AwPJEgMDBSsHyRYDAwUHxgLCAsoCAwM3AQMDAwM3AQMDAwM3AQMDAwM3AQMDBwY3AwcLFdIC1gLaAt4CBQY3AwUD4gIfBx4DxwMFA2oCFQciAw8DBQXOAuoCHQcmAw8DBQXmAu4CAwMdAQMDAwMdAQMDAwMdAQMDAwMdAQMDBwYdAwcLFfYC+gL+AgIDBQYdAwUDBgMFBh0DBwPyAg0EHQ0OAxX2AvoC/gICAwMDpxEDAREAQgMDAQURAEIDAwNBNgIDAQMDQREDAQMDQQcDAQsHQZsDDQUHQRkGOgIDAQNHAwNZBwMBCwdZUwMNBUlLGxRZA00JAx1BAwMpAQMDAwMpAQMDAwMpAQMDAwMpAQMDBwYpAwcLFYeJi40FBikDBQOPJwZKAgMRA5EDAxUBAwMDAxUBAwMDAxUBAwMDAxUBAwMHBhUDEwsPlZeZmwUGFQMRA50FBhUDEwOTDQQVDaEPlZeZmxEAPgMDAQURAD4DAwM9BwMBAwM9EQMBAwM9BwMBCwc9mwMNBQdPGQYeAgMBA1UDA1EHAwELB1FTAw0FV1kbFFEDWwkDN30DA80uAwMJCQbNAwUDhwMDHxMDAwMDHwEDAwMDHwEDAwMDHwEDAwcGHwMHCxGLjY+RBQYfAwUDkwUGHwMHA4kNBB8NlxGLjY+RAwPPRQMJCQbPAwUDmQMDIRMDAwMDIQEDAwMDIQEDAwMDIQEDAwcGIQMHCxOdn6GjBQYhAwUDpQUGIQMHA5sNBCENqROdn6GjAwPRRQMJCQbRAwUDqwMDIxMDAwMDIwEDAwMDIwEDAwMDIwEDAwcGIwMHCxWvsbO1BQYjAwUDtwUGIwMHA60NBCMNuxWvsbO1EQAqAwMBBREAKgMDA50RAwETB50JAwEFBV0DAz8nAwEPBz8JAwEFX2EDA6MRAwElB6MJAwEFY2UDAz8nAwEPBz8JAwEFB2kDA1URAwEDA1UHAwELB1WVAw0FZ2sZBi4CAwEDcQMDVwcDAQsHV1MDDQVzdRsUVwN3CQMKAjoEAwOnBwMBAwMrEwMDAwMrAQMDAwMrAQMDAwMrAQMDBwYrAwcLEYmLjY8FBisDBQORAwMtEwMDAwMtAQMDAwMtAQMDAwMtAQMDBwYtAwcLE5WXmZsFBi0DBQOdAwMvEwMDAwMvAQMDAwMvAQMDAwMvAQMDBwYvAxMLCaGjpacFBi8DEQOpAwOpJwMBDwepCQMBBYetAwMxEwMDAwMxAQMDKQYxAwMDrwMDMQEDAwcGMQMTCwuxs7W3BQYxAxEDuQMDq1YCAwsrB6teAgMLB6u7vS0DbgJqAgMPAwOvJwMBDwevCQMBBQXDCQaxAw8DxRMHsQkDDwXBxy0DfgJ6AgMPAwOzJwMBDwezCQMBBQfNEwdfCQMBBc+vCQZfAw8D0RMHXwkDDwXL0wMDYREDAQMDYQcDAQsHYYYCAyEF1ckDA7VFAwkDA7WOAgMJCQa5AwsD3QkGuQMLA98XBpICAwsH2+HjHQeaAg8DCwW/5QMDu54CAxUvB7umAgMVBefpBQa2AgMfA+sJBr0DBQPtNQe9DwMFBZPvHwfCAroCAwsD8TEHxgIPAwsF5/MzB8oCDwMLA/UxB9ICDwMFBZPxMwfaAg8DBQP5FQfeAg8DBQX7nwMDv+ICAxUvB7/mAgMVBff/BQbqAgMfAwICCQbBAwUDBgIdB8EPAwUFCgL9AwMXEwMDAwMXAQMDAwMXAQMDAwMXAQMDBwYXAwcLExICFgIaAh4CBQYXAwUDIgIFBhcDBwMOAg0EFw0qAhMSAhYCGgIeAgMDGRMDAwMDGQEDAwMDGQEDAwMDGQEDAwcGGQMHCxEuAjICNgI6AgUGGQMFAz4CBQYZAwcD8Q0EGQ1GAhEuAjICNgI6AgMDY0UDCQkGYwMFA0oCNwdj7gIDIwUOAk4CAwNlwwMJCQZlAwUDVgI5B2UPAwUFWgIOAgMD8gLDAwkJBvYCAwUDYgIXBvoCAwUHUgJmAl4CAwMzEwMDAwMzAQMDAwMzAQMDAwMzAQMDBwYzAwcLFW4CcgJ2AnoCBQYzAwUDfgIVB8UPAwUF/WoCHwcCA8cDBQOGAhUHxQ8DBQWCAooCAwMbEwMDAwMbAQMDAwMbAQMDAwMbAQMDBwYbAwcLFZIClgKaAp4CBQYbAwUDogIFBhsDBwOOAg0EGw2qAhWSApYCmgKeAgMDNRMDAwMDNQEDAykGNQMDA68DAzUBAwMHBjUDEwsNrgKyArYCugIFBjUDEQO+AicGDgMDJQP3AwPJEgMDBSsHyRYDAwUHxgLCAsoCAwM3EwMDAwM3AQMDAwM3AQMDAwM3AQMDBwY3AwcLFdIC1gLaAt4CBQY3AwUD4gIfBx4DxwMFA2oCFQciAw8DBQXOAuoCHQcmAw8DBQXmAu4CAwMdEwMDAwMdAQMDAwMdAQMDAwMdAQMDBwYdAwcLFfYC+gL+AgIDBQYdAwUDBgMFBh0DBwPyAg0EHQ0OAxX2AvoC/gICAwMDpxEDAREATgIDAQURAE4CAwNBNgIDAQMDQREDAQMDQQcDAQsHQZsDDQUHeRkGOgIDAQN/AwNZBwMBCwdZUwMNBYGDGxRZA4UJAx1BAwMpEwMDAwMpAQMDAwMpAQMDAwMpAQMDBwYpAwcLFYeJi40FBikDBQOPJwZKAgMRA5EDAxUTAwMDAxUBAwMDAxUBAwMDAxUBAwMHBhUDEwsPlZeZmwUGFQMRA50FBhUDEwOTDQQVDaEPlZeZmxEARgIDAQURAEYCIwADIREDngMHAw0PCQEDAQMBAwEDAwMDBwMBAwMDBwMBIwQDCQEDBQkhEQOiAwcDJ0MJAQMBAwEDAQMDA4URAwETB4UJAwEFBQkDAzknAwEPBzkJAwEFCw0DA5ERAwElB5EJAwEFDxEDAzknAwEPBzkJAwEFBxUDA00RAwEDA00HAwELB02VAw0FExcDA5cHAwEXBpcDAQcdBx8DAwMHAwEDAwMHAwEjBAMJAQMhIyERA6YDBwMnQwkBAwEDAQMBAwMDhREDARMHhQkDAQUFCQMDOScDAQ8HOQkDAQULDQMDkREDASUHkQkDAQUPEQMDOScDAQ8HOQkDAQUHFQMDTREDAQMDTQcDAQsHTZUDDQUTFwMDlwcDARcGlwMBBx0HHwMDAwcDAQMDAwcDASMEAwkBAyEjIREDqgMHAw0PCQEDAQMBAwEDAwMDBwMBAwMDBwMBIwQDCQEDBQkGAwEFAQD6FssTCxkLGQkJDRsNHSsdGy0jHQsjISMpLQsNHwsTDQ0dHRsbCRsZGRkZMScRDQkVFQtrmxEdJS0VHQsFSxMlCw0LDQvrFxcfExcvExcjGxcZFRcXDxkbFxcVFxsXIxklHw8PDQkdEWJ1aWx0aW4Ac3RhYmxlX21vc2FpYwB0cHUAYXJpdGgAdmVjdG9yAG1vZHVsZQBhcml0aC5jb25zdGFudAB2ZWN0b3Iuc2hhcGVfY2FzdAB2ZWN0b3IubG9hZAB2ZWN0b3IuYnJvYWRjYXN0AGFyaXRoLmNtcGkAdmVjdG9yLnN0b3JlAGFyaXRoLm11bGkAc2NmLnlpZWxkAGFyaXRoLmFkZGkAYXJpdGgubXVsZgBhcml0aC5zZWxlY3QAYXJpdGguZXh0dWkAc2NmLmlmAGFyaXRoLmFkZGYAdHB1LnJlcGVhdABmdW5jLmZ1bmMAZnVuYy5yZXR1cm4AYXJpdGguc3ViaQBhcml0aC50cnVuY2YAYXJpdGguaW5kZXhfY2FzdAB0cHUubWF0bXVsAHRwdS5pb3RhAHZlY3Rvci5tdWx0aV9yZWR1Y3Rpb24AYXJpdGguc3ViZgBtYXRoLmV4cABhcml0aC5tYXhpbXVtZgBhcml0aC5jbXBmAGFyaXRoLmRpdmYAL2hvbWUvYmJhaGwvbWluaWNvbmRhMy9lbnZzL3RvcmNoMzEwL2xpYi9weXRob24zLjEwL3NpdGUtcGFja2FnZXMvamF4L2V4cGVyaW1lbnRhbC9wYWxsYXMvb3BzL3RwdS9mbGFzaF9hdHRlbnRpb24ucHkAYm9keQB2YWx1ZQAvbXVsAC9zd2FwAC9hZGQAL2Jyb2FkY2FzdF9pbl9kaW0Ac3ltX25hbWUAX2ZsYXNoX2F0dGVudGlvbl9rZXJuZWxfc2luZ2xlX2JhdGNoAC0AL2dldABmdW5jdGlvbl90eXBlAHByZWRpY2F0ZQAvY29udmVydF9lbGVtZW50X3R5cGUAdHJhbnNmb3JtX2luZGljZXMAd2luZG93X2JvdW5kcwBmb3J3YXJkAC9ob21lL2JiYWhsL3RyYW5zZm9ybWVycy9zcmMvdHJhbnNmb3JtZXJzL21vZGVscy9taXh0cmFsL21vZGVsaW5nX21peHRyYWwucHkAL2hvbWUvYmJhaGwvdHJhbnNmb3JtZXJzL3NyYy90cmFuc2Zvcm1lcnMvdHJhaW5lci5weQAvc3ViAGRpbWVuc2lvbgAvc2VsZWN0X24AL2VxAC9jb25kAC9yZXBlYXQAc3RhcnRfbmV3X3NlcXVlbmNlAF9mbGFzaF9hdHRlbnRpb25fa2VybmVsAHRyYW5zZm9ybV8wAHRyYW5zZm9ybV8xAHRyYW5zZm9ybV8yAHRyYW5zZm9ybV8zAGt2X2luZGV4X21hcAAvZ3QAL21hc2tlZF9sb2FkAC9kb3RfZ2VuZXJhbAB0cmFuc3Bvc2VfbGhzAHRyYW5zcG9zZV9yaHMAL2lvdGEAL3BqaXQAZmFzdG1hdGgAa2luZAByZWR1Y3Rpb25fZGltcwB0aW1lcwAvZXhwAHN0YWJsZV9tb3NhaWMudmVyc2lvbgBkaW1lbnNpb25fc2VtYW50aWNzAGl0ZXJhdGlvbl9ib3VuZHMAc2NhbGFyX3ByZWZldGNoAHNjcmF0Y2hfb3BlcmFuZHMAbWFpbgB3aW5kb3dfcGFyYW1zAGJlbG93X29yX29uX2RpYWcAX2ZsYXNoX2F0dGVudGlvbl9pbXBsAGNvbXB1dGVfbG9zcwB0cmFpbmluZ19zdGVwAF9pbm5lcl90cmFpbmluZ19sb29wAG92ZXJmbG93RmxhZ3MAdHJhaW4Ac3RvcmVfb3V0cHV0AC9zY2FuAHJ1bgAvbGUAL3JlZHVjZV9tYXgAL21heAAvcmVkdWNlX3N1bQAvZGl2ADxsYW1iZGE+AA==\", \"cost_estimate\": {\"flops\": 828979544064.0, \"transcendentals\": 1073741824.0, \"bytes_accessed\": 268435456}, \"serialization_format\": 1, \"needs_layout_passes\": true}, \"implicit_sharding\": {\"type\": \"MANUAL\"}}"
+
+      args = [q, k, v]
+      if ab is not None:
+        args += [ab]
+      if segment_ids is not None:
+        args += [q_segment_ids, kv_segment_ids]
+      o = torch_xla._XLAC._xla_tpu_custom_call(args, payload, shapes, dtypes)
+
+      if not save_residuals:
+        o = o[0]
+        # SPMD integration
+        if partition_spec is not None:
+          o = xs.disable_manual_sharding(
+              o, partition_spec, ctx.full_shape, mesh=mesh).global_tensor
+        return o
+      o, *aux = o
+      l, m = (v[..., 0] for v in aux[-2:])
+
+    # SPMD integration
+    if partition_spec is not None:
+      o = xs.disable_manual_sharding(
+          o, partition_spec, ctx.full_shape, mesh=mesh).global_tensor
+      l = xs.disable_manual_sharding(
+          l, partition_spec[0:3], ctx.full_shape[0:3], mesh=mesh).global_tensor
+      m = xs.disable_manual_sharding(
+          m, partition_spec[0:3], ctx.full_shape[0:3], mesh=mesh).global_tensor
+
+    ctx.save_for_backward(full_q, full_k, full_v, o, l, m, q_segment_ids,
+                          kv_segment_ids, full_ab)
+    return o
+
+  @staticmethod
+  def backward(ctx, grad_output):
+    q, k, v, o, l, m, q_segment_ids, kv_segment_ids, ab = ctx.saved_tensors
+    causal = ctx.causal
+    sm_scale = ctx.sm_scale
+    partition_spec = ctx.partition_spec
+    mesh = ctx.mesh
+    full_shape = ctx.full_shape
+    segment_ids = ctx.segment_ids
+    grad_q = grad_k = grad_v = grad_ab = None
+
+    grad_i = torch.sum(
+        o.to(torch.float32) * grad_output.to(torch.float32),
+        axis=-1)  # [batch_size, num_heads, q_seq_len]
+
+    expanded_l = l.unsqueeze(-1).expand([-1 for _ in l.shape] +
+                                        [FlashAttention.MIN_BLOCK_SIZE])
+    expanded_m = m.unsqueeze(-1).expand([-1 for _ in m.shape] +
+                                        [FlashAttention.MIN_BLOCK_SIZE])
+    expanded_grad_i = grad_i.unsqueeze(-1).expand(
+        [-1 for _ in grad_i.shape] + [FlashAttention.MIN_BLOCK_SIZE])
+
+    # SPMD integration
+    if partition_spec is not None:
+      q = xs.enable_manual_sharding(q, partition_spec, mesh=mesh).global_tensor
+      k = xs.enable_manual_sharding(k, partition_spec, mesh=mesh).global_tensor
+      v = xs.enable_manual_sharding(v, partition_spec, mesh=mesh).global_tensor
+      expanded_l = xs.enable_manual_sharding(
+          expanded_l, partition_spec, mesh=mesh).global_tensor
+      expanded_m = xs.enable_manual_sharding(
+          expanded_m, partition_spec, mesh=mesh).global_tensor
+      grad_output = xs.enable_manual_sharding(
+          grad_output, partition_spec, mesh=mesh).global_tensor
+      expanded_grad_i = xs.enable_manual_sharding(
+          expanded_grad_i, partition_spec, mesh=mesh).global_tensor
+      if ab:
+        ab = xs.enable_manual_sharding(
+            ab, partition_spec, mesh=mesh).global_tensor
+
+    if ctx.needs_input_grad[0]:
+      payload = "{\"custom_call_config\": {\"body\": \"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nQMDHwMDAwMDHwMDAwMDHwMDAwMDHwMDAwUGHwMZCxOho6WnBwYfAxcDqQMDIQMDAwMDIQMDAwMDIQMDAwMDIQMDAwUGIQMbCxWtr7GzBwYhAwcDtQMDfXsDBRcHfX8DBQdve7klA/v5Aw0DA4FPAwEJB4EJAwEFBb8LBoMDDQPBEweDCQMNBb3DJQMSAg4CAw0DAzVRAwEJBzUJAwEFB8kDAzV3AwEJBzUJAwEFX80TB0UJAwEFy88LBkUDDQPREwdFCQMNBcfTAwNHEwMBAwNHBwMBDQdHGgIDJQXVxQMDhXMDCQMDhR4CAwkLBokDBQPdCwaJAwUD3xsGIgIDBQfb4eMnByYCDwMFBbvlGQcuAkkDBQOfKQc2Ag8DBQXn6TEHOgIPAwUD6wMDSz4CAwkLBksDBwPvMwdLDwMHBfGTGQdCAkkDBQPzKwdKAg8DBQXt9QMDi3sDBRcHi38DBQerh/kZB04CSQMFA7cpB1ICDwMFBfv9KwdWAg8DBQX/9wMDTQMDAwMDTQMDAwUGTQMHBxkGAgoCLwZaAgMnAwICAwOPXgIDBxcHj2ICAwcHEgJ7FgInB2YCDwMHBQ4CGgIDAzcDAwMDAzcDAwMFBjcDBwcZIgImAh0ENwkeAhkiAiYCAwOxEwMBAwN5dwMBCQd5CQMBBS4CMgIDAxUDAwMDAxUDAwMDAxUDAwMDAxUDAwMFBhUDGQsJOgI+AkICRgIHBhUDFwNKAgMDFwMDAwMDFwMDAyMGFwMDAzYCAwMXAwMDBQYXAx8LC1ICVgJaAl4CBwYXAyEDYgIDAxkDAwMDAxkDAwMjBhkDAwM2AgMDGQMDAwUGGQMfCw1qAm4CcgJ2AgcGGQMhA3oCAwMbAwMDAwMbAwMDAwMbAwMDAwMbAwMDBQYbAxsLD4IChgKKAo4CBwYbAwcDkgIDAx0DAwMDAx0DAwMDAx0DAwMDAx0DAwMFBh0DGwsRmgKeAqICpgIHBh0DBwOqAgMDHwMDAwMDHwMDAwMDHwMDAwMDHwMDAwUGHwMZCxOyArYCugK+AgcGHwMXA8ICAwMhAwMDAwMhAwMDAwMhAwMDAwMhAwMDBQYhAxsLFcoCzgLSAtYCBwYhAwcD2gIDA317AwUXB31/AwUHTgJmAuICJQP7+QMNAwOBTwMBCQeBCQMBBQXuAgsGgwMNA/ICEweDCQMNBeoC9gIlAxICDgIDDQMDNVEDAQkHNQkDAQUHAgMDAzV3AwEJBzUJAwEFLgIKAxMHRQkDAQUGAw4DCwZFAw0DEgMTB0UJAw0F/gIWAwMDRxMDAQMDRwcDAQ0HRxoCAyUFGgP6AgMDhXMDCQMDhR4CAwkLBokDBQMqAwsGiQMFAy4DGwYiAgMFByYDMgM2AycHJgIPAwUF5gI6AxkHLgJJAwUDrgIpBzYCDwMFBT4DQgMxBzoCDwMFA0YDAwNLPgIDCQsGSwMHA04DMwdLDwMHBVIDlgIZB0ICSQMFA1YDKwdKAg8DBQVKA1oDAwOLewMFFweLfwMFB8YCfgJiAxkHTgJJAwUD3gIpB1ICDwMFBWYDagMrB1YCDwMFBW4DXgMDA00DAwMDA00DAwMFBk0DBwcZdgN6Ay8GWgIDJwNyAwMDj14CAwcXB49iAgMHB4IDZgKGAycHZgIPAwcFfgOKAwMDNwMDAwMDNwMDAwUGNwMHBxmSA5YDHQQ3CY4DGZIDlgMDA7EGBQMBFQDxAwEFFQDxHwaKAwMBA0MDA6cHAwENB6djAwsFS00hFKcDTwsDAQUVAO8DAQUVAO8DA2uWAwMBAwNrEwMBAwNrBwMBDQdr3QMLBQdRHwaqAwMBA1cDA6kHAwENB6ljAwsFWVshFKkDXQkDIU0DA6sDAwMDA6sDAwMFBqsDBwcZX2EvBsIDAxcDYwMDMwMDAwMDMwMDAwMDMwMDAwMDMwMDAwUGMwMZCxdnaWttBwYzAxcDbwcGMwMZA2UdBDMNcxdnaWttAwPrcwMJCwbrAwcDdQMDdQMDAwMDdQMDAwUGdQMHBxl5ex0EdQl3GXl7FQDnAwEFFQDnEQABDxEB7gIHAw0PCQEBAQEBAQEBAwMBBwMBAwMBBwMBEQQBCQEDBQkPEQHyAgcDJ0MJAQEBAQEBAQEDA1MTAwETB1MJAwEFBQkDAzFPAwEJBzEJAwEFCw0DA1cTAwEtB1cJAwEFDxEDAzFRAwEJBzEJAwEFBxUDA0ETAwEDA0EHAwENB0GXAwsFExcDA10HAwEbBl0DAQcdBx8DAwEHAwEDAwEHAwERBAEJAQMhIw8RAfYCBwMnQwkBAQEBAQEBAQMDUxMDARMHUwkDAQUFCQMDMU8DAQkHMQkDAQULDQMDVxMDAS0HVwkDAQUPEQMDMVEDAQkHMQkDAQUHFQMDQRMDAQMDQQcDAQ0HQZcDCwUTFwMDXQcDARsGXQMBBx0HHwMDAQcDAQMDAQcDAREEAQkBAyEjDxEB+gIHAw0PCQEBAQEBAQEBAwMBBwMBAwMBBwMBEQQBCQEDBQkPEQH+AgcDDQ8JAQEBAQEBAQEDAwEHAwEDAwEHAwERBAEJAQMFCQ8RAQIDBwMNDwkBAQEBAQEBAQMDAQcDAQMDAQcDAREEAQkBAwUJDxEBBgMHAw0PCQEBAQEBAQEBAwMBBwMBAwMBBwMBEQQBCQEDBQkPEQEKAwcDDQ8JAQEBAQEBAQEDAwEHAwEDAwEHAwERBAEJAQMFCQYDAQUBAFISrycLCw0TDQkJDR0xIx0LIyEjKS0NHR0bJwkJGxkZGRkZGRkZERUbJRUNBQ0VCy0LCwsdJR03Ew0L6xcTGxcXFxcTIw8ZGxsXFxUXGRUXIxclGR8PDQkdEWJ1aWx0aW4Ac3RhYmxlX21vc2FpYwB0cHUAYXJpdGgAbW9kdWxlAGFyaXRoLmNvbnN0YW50AHZlY3Rvci5sb2FkAHZlY3Rvci5zaGFwZV9jYXN0AGFyaXRoLm11bGkAdmVjdG9yLmJyb2FkY2FzdABhcml0aC5jbXBpAGZ1bmMuZnVuYwBmdW5jLnJldHVybgBhcml0aC5hZGRpAHNjZi55aWVsZAB0cHUubWF0bXVsAHRwdS5yZXBlYXQAYXJpdGguc2VsZWN0AHZlY3Rvci5zdG9yZQBhcml0aC5leHR1aQBzY2YuaWYAYXJpdGguaW5kZXhfY2FzdAB0cHUuaW90YQBhcml0aC5hZGRmAGFyaXRoLnN1YmYAYXJpdGgubXVsZgBhcml0aC5zdWJpAGFyaXRoLnRydW5jZgBtYXRoLmV4cABhcml0aC5kaXZmAC9ob21lL2JiYWhsL21pbmljb25kYTMvZW52cy90b3JjaDMxMC9saWIvcHl0aG9uMy4xMC9zaXRlLXBhY2thZ2VzL2pheC9leHBlcmltZW50YWwvcGFsbGFzL29wcy90cHUvZmxhc2hfYXR0ZW50aW9uLnB5AGJvZHkAdmFsdWUAc3ltX25hbWUAX2ZsYXNoX2F0dGVudGlvbl9kcV9rZXJuZWwAZnVuY3Rpb25fdHlwZQB0cmFuc2Zvcm1faW5kaWNlcwB3aW5kb3dfYm91bmRzAC9tdWwAL2dldAAvYWRkAC9jb252ZXJ0X2VsZW1lbnRfdHlwZQAvc3ViAHByZWRpY2F0ZQAvY29uZAAtAC9zd2FwAC9zZWxlY3RfbgAvYnJvYWRjYXN0X2luX2RpbQAvZG90X2dlbmVyYWwAZGltZW5zaW9uAC9yZXBlYXQAdHJhbnNmb3JtXzAAdHJhbnNmb3JtXzEAdHJhbnNmb3JtXzIAdHJhbnNmb3JtXzMAdHJhbnNmb3JtXzQAdHJhbnNmb3JtXzUAdHJhbnNmb3JtXzYAdHJhbnNmb3JtXzcAa3ZfaW5kZXhfbWFwAC9ndAAvZXEAZW5kX29mX2t2X3NlcXVlbmNlAC9tYXNrZWRfbG9hZAB0cmFuc3Bvc2VfbGhzAHRyYW5zcG9zZV9yaHMAL2lvdGEAc3RhYmxlX21vc2FpYy52ZXJzaW9uAGRpbWVuc2lvbl9zZW1hbnRpY3MAaXRlcmF0aW9uX2JvdW5kcwBzY2FsYXJfcHJlZmV0Y2gAc2NyYXRjaF9vcGVyYW5kcwBtYWluAHdpbmRvd19wYXJhbXMAYmVsb3dfb3Jfb25fZGlhZwBfZmxhc2hfYXR0ZW50aW9uX2J3ZF9kcQBvdmVyZmxvd0ZsYWdzAC9zY2FuAHJ1bgAvbGUAL3BqaXQAZmFzdG1hdGgAdGltZXMAL2V4cAAvZGl2AHN0YXJ0X25ld19zZXF1ZW5jZQA=\", \"serialization_format\": 1, \"needs_layout_passes\": true}, \"implicit_sharding\": {\"type\": \"MANUAL\"}}"
+
+      args = [q, k, v]
+      if ab is not None:
+        args += [ab]
+      if segment_ids is not None:
+        args += [q_segment_ids, kv_segment_ids]
+      args += [expanded_l, expanded_m, grad_output, expanded_grad_i]
+
+      outputs = [q]
+      if ab is not None:
+        outputs += [ab]
+      grads = torch_xla._XLAC._xla_tpu_custom_call(args, payload,
+                                                   [i.shape for i in outputs],
+                                                   [i.dtype for i in outputs])
+      if ctx.needs_input_grad[0]:
+        grad_q = grads[0]
+      if ctx.needs_input_grad[-3]:
+        grad_ab = grads[1]
+
+    if ctx.needs_input_grad[1] or ctx.needs_input_grad[2]:
+      payload = "{\"custom_call_config\": {\"body\": \"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BTM1AwNZEQMBBwdZDQMBBQU5AwN3DwMBAwN3BwMBEQd3TwMNBTc7IwZiAwMBA0EDA3sHAwERB3t1Aw0FQ0UlFHsDRwkD2XoDAwPbBwMBAwPhEQMBBwfhDQMBBVdZAwPlBwMBAwPnEQMBBwfnDQMBBV1fAwM9BQMDAwM9BQMDCwY9AwMDYQMDPQUDAwUGPQMTCwtjZWdpCQY9AxEDawMDPwUDAwMDPwUDAwsGPwMDA2EDAz8FAwMFBj8DEwsNb3FzdQkGPwMRA3cDA0EFAwMDA0EFAwMLBkEDAwNbAwNBBQMDBQZBAxMLCXt9f4EJBkEDEQODAwNDBQMDAwNDBQMDCwZDAwMDWwMDQwUDAwUGQwMdCw+HiYuNCQZDAwUDjwMDRQUDAwMDRQUDAwsGRQMDA1sDA0UFAwMFBkUDHQsRk5WXmQkGRQMFA5sDA0cFAwMDA0cFAwMLBkcDAwNbAwNHBQMDBQZHAxMLE5+ho6UJBkcDEQOnAwNJBQMDAwNJBQMDCwZJAwMDWwMDSQUDAwUGSQMdCxWrra+xCQZJAwUDswMD6+kDByEH6+0DBweFbbcrAz4EOgQDFwMD9REDAQcH9Q0DAQUHvRMHjw0DAQW/WxUGjwMXA8ETB48NAxcFu8MrA1oEVgQDFwMD+REDAQcH+Q0DAQUFyRMHkQ0DAQXLYRUGkQMXA80TB5ENAxcFx88DA5MPAwEDA5MHAwERB5OCBAMlBdHFAwMGApUDCQMDBgKWBAMJFQYOAgMHA9kVBg4CAwcD2x0GJgUDBwfX3d8nBy4FJwMHBbnhKQc6BZkDBwOdLQdGBScDBwXj5TMHSgUnAwcD5wMDnV4FAwkVBp0DBQPrNQedJwMFBe2RKQd2BZkDBwPvLweCBScDBwXp8TEHjgUeAgMHA/MfBpoFAx8D9QMDKgImAgMFIQcqAi4CAwUH96n5CwahAwMDYQMDoQUDAwUGoQMFBx39/ycHqgUnAwUFAgL7CwZnAwMDYQMDZwUDAwUGZwMFBx0KAg4CGQRnCQYCHQoCDgIDAzoC6QMHIQc6Au0DBwepeRYCKQfGBZkDBwO1LQfSBScDBwUaAh4CLwfWBScDBwUiAvMxB9oFHgIDBwMmAh8G5gUDHwMqAgMDPgImAgMFIQc+Ai4CAwUHLgKFMgILBqcDAwNhAwOnBQMDBQanAwUHGzoCPgInB/IFJwMFBUICNgILBmkDAwNhAwNpBQMDBQZpAwUHG0oCTgIZBGkJRgIbSgJOAgMD5Q8DAQMD2w8DARcA2QMBBRcA2QMDW24DAwEDA1sPAwEDA1sHAwERB1vNAw0FB0kjBoIDAwEDTwMDfQcDAREHfXUDDQVRUyUUfQNVCQMtZQMDgQUDAwMDgQUDAwUGgQMFBx1XWR8GmgMDEQNbAwMtBQMDAwMtBQMDAwMtBQMDAwMtBQMDBQYtAxMLGV9hY2UJBi0DEQNnCQYtAxMDXRkELQ1rGV9hY2UDA4UFAwMDA4UFAwMFBoUDBQcbbW8fBqYDAxEDcQMDLwUDAwMDLwUDAwMDLwUDAwMDLwUDAwUGLwMTCxd1d3l7CQYvAxEDfQkGLwMTA3MZBC8NgRd1d3l7FwDTAwEFFwDTDwABDREB4gIHAydDCQEBAQEBAQEBAwM3DwMBEwc3DQMBBQcJAwMTEQMBBwcTDQMBBQsNAwM5DwMBGwc5DQMBBQ8RAwMTEQMBBwcTDQMBBQUVAwMjDwMBAwMjBwMBEQcjTwMNBRMXAwM7BwMBHQY7AwEHHQcfAwMBBwMBAwMBBwMBDwQBCQEDISMNEQHmAgcDDQ8JAQEBAQEBAQEDAwEHAwEDAwEHAwEPBAEJAQMFCQ0RAeoCBwMNDwkBAQEBAQEBAQMDAQcDAQMDAQcDAQ8EAQkBAwUJDREB7gIHAw0PCQEBAQEBAQEBAwMBBwMBAwMBBwMBDwQBCQEDBwkNEQHyAgcDDQ8JAQEBAQEBAQEDAwEHAwEDAwEHAwEPBAEJAQMHCQ0RAfYCBwMnQwkBAQEBAQEBAQMDNw8DARMHNw0DAQUHCQMDExEDAQcHEw0DAQULDQMDOQ8DARsHOQ0DAQUPEQMDExEDAQcHEw0DAQUFFQMDIw8DAQMDIwcDAREHI08DDQUTFwMDOwcDAR0GOwMBBx0HHwMDAQcDAQMDAQcDAQ8EAQkBAyEjDREB+gIHAydDCQEBAQEBAQEBAwM3DwMBEwc3DQMBBQcJAwMTEQMBBwcTDQMBBQsNAwM5DwMBGwc5DQMBBQ8RAwMTEQMBBwcTDQMBBQUVAwMjDwMBAwMjBwMBEQcjTwMNBRMXAwM7BwMBHQY7AwEHHQcfAwMBBwMBAwMBBwMBDwQBCQEDISMNEQH+AgcDDQ8JAQEBAQEBAQEDAwEHAwEDAwEHAwEPBAEJAQMFCQ0RAQIDBwMNDwkBAQEBAQEBAQMDAQcDAQMDAQcDAQ8EAQkBAwUJBgMBBQEAchfLGQsLDRNrGy0xSwsNCR0zIx0LIyEjKS0nGxcNHR0PCQ0lCwkVCRsZGRkZGRkZGRkRJRUFDZsRGw0VCy0LOQsbHSUNHRMP6xcTIxcXExcXDxkXGxsXGxUjFxcZFSMlFxkfDw0JHRFidWlsdGluAHN0YWJsZV9tb3NhaWMAdHB1AGFyaXRoAG1vZHVsZQBhcml0aC5jb25zdGFudAB2ZWN0b3IubG9hZABhcml0aC5tdWxpAHZlY3Rvci5zaGFwZV9jYXN0AGFyaXRoLmluZGV4X2Nhc3QAZnVuYy5mdW5jAGZ1bmMucmV0dXJuAGFyaXRoLmNtcGkAYXJpdGguYWRkaQB2ZWN0b3IuYnJvYWRjYXN0AHNjZi55aWVsZAB2ZWN0b3Iuc3RvcmUAYXJpdGguc3ViaQBhcml0aC5zZWxlY3QAYXJpdGgudHJ1bmNmAHRwdS5tYXRtdWwAYXJpdGguZXh0dWkAc2NmLmlmAGFyaXRoLmFkZGYAdHB1LnJlcGVhdAB0cHUuaW90YQBhcml0aC5zdWJmAGFyaXRoLm11bGYAdmVjdG9yLnRyYW5zcG9zZQBtYXRoLmV4cABhcml0aC5kaXZmAC9ob21lL2JiYWhsL21pbmljb25kYTMvZW52cy90b3JjaDMxMC9saWIvcHl0aG9uMy4xMC9zaXRlLXBhY2thZ2VzL2pheC9leHBlcmltZW50YWwvcGFsbGFzL29wcy90cHUvZmxhc2hfYXR0ZW50aW9uLnB5AGtfYm9keQBzeW1fbmFtZQBmdW5jdGlvbl90eXBlAHZhbHVlAHRyYW5zZm9ybV9pbmRpY2VzAHdpbmRvd19ib3VuZHMAL21hc2tlZF9sb2FkAC9tdWwAX2ZsYXNoX2F0dGVudGlvbl9ka3Zfa2VybmVsAC9hZGQAL2NvbnZlcnRfZWxlbWVudF90eXBlAC9zdWIAcHJlZGljYXRlAC9zd2FwAC9kb3RfZ2VuZXJhbABmb3J3YXJkAC9ob21lL2JiYWhsL3RyYW5zZm9ybWVycy9zcmMvdHJhbnNmb3JtZXJzL21vZGVscy9taXh0cmFsL21vZGVsaW5nX21peHRyYWwucHkAL2NvbmQALQBkaW1lbnNpb24AL2Jyb2FkY2FzdF9pbl9kaW0AL3JlcGVhdAB0cmFuc2Zvcm1fMAB0cmFuc2Zvcm1fMQB0cmFuc2Zvcm1fMgB0cmFuc2Zvcm1fMwB0cmFuc2Zvcm1fNAB0cmFuc2Zvcm1fNQB0cmFuc2Zvcm1fNgB0cmFuc2Zvcm1fNwB0cmFuc2Zvcm1fOABxb19pbmRleF9tYXAAL2d0AC9zZWxlY3RfbgAvZXEAL2dldABlbmRfb2ZfcV9zZXF1ZW5jZQAvc2NhbgBydW4AcV9ib2R5AHRyYW5zcG9zZV9saHMAdHJhbnNwb3NlX3JocwAvaW90YQAvdHJhbnNwb3NlAC9tYXNrZWRfc3dhcABzdGFydF9uZXdfc2VxdWVuY2UAc3RhYmxlX21vc2FpYy52ZXJzaW9uAGRpbWVuc2lvbl9zZW1hbnRpY3MAaXRlcmF0aW9uX2JvdW5kcwBzY2FsYXJfcHJlZmV0Y2gAc2NyYXRjaF9vcGVyYW5kcwBtYWluAHdpbmRvd19wYXJhbXMAYmVsb3dfb3Jfb25fZGlhZwBfZmxhc2hfYXR0ZW50aW9uX2J3ZF9ka3YAb3ZlcmZsb3dGbGFncwAvbGUAL3BqaXQAYm9keQBfZmxhc2hfYXR0ZW50aW9uX2tlcm5lbF9zaW5nbGVfYmF0Y2gAX2ZsYXNoX2F0dGVudGlvbl9rZXJuZWwAX2ZsYXNoX2F0dGVudGlvbl9pbXBsAGNvbXB1dGVfbG9zcwAvaG9tZS9iYmFobC90cmFuc2Zvcm1lcnMvc3JjL3RyYW5zZm9ybWVycy90cmFpbmVyLnB5AGZhc3RtYXRoAHRpbWVzAC9leHAAL2RpdgBwZXJtdXRhdGlvbgA=\", \"serialization_format\": 1, \"needs_layout_passes\": true}, \"implicit_sharding\": {\"type\": \"MANUAL\"}}"
+
+      grads = torch_xla._XLAC._xla_tpu_custom_call(args, payload,
+                                                   [k.shape, v.shape],
+                                                   [k.dtype, v.dtype])
+
+    if ctx.needs_input_grad[1]:
+      grad_k = grads[0]
+    if ctx.needs_input_grad[2]:
+      grad_v = grads[1]
+
+    # SPMD integration
+    if partition_spec is not None:
+      grad_q = xs.disable_manual_sharding(
+          grad_q, partition_spec, full_shape, mesh=mesh).global_tensor
+      grad_k = xs.disable_manual_sharding(
+          grad_k, partition_spec, full_shape, mesh=mesh).global_tensor
+      grad_v = xs.disable_manual_sharding(
+          grad_v, partition_spec, full_shape, mesh=mesh).global_tensor
+
+    return grad_q, grad_k, grad_v, None, None, None, None, grad_ab, None, None
+
 class Gmm(torch.autograd.Function):
     @staticmethod
     def _eager_gmm(
@@ -1038,15 +1227,15 @@ class Gmm(torch.autograd.Function):
 
         # Replicated MixtralBlockSparseTop2MLP.forward
         # Here we just use silu and ignore the configuration given we need to manually write the backward pass.
-        gmm1 = Gmm.gmm_no_jax_gate1(hidden_states_sorted, w1, group_sizes)
-        gmm3 = Gmm.gmm_no_jax_gate1(hidden_states_sorted, w3, group_sizes)
-        # gmm1 = gmm(hidden_states_sorted, w1, group_sizes)
-        # gmm3 = gmm(hidden_states_sorted, w3, group_sizes)
+        # gmm1 = Gmm.gmm_no_jax_gate1(hidden_states_sorted, w1, group_sizes)
+        # gmm3 = Gmm.gmm_no_jax_gate1(hidden_states_sorted, w3, group_sizes)
+        gmm1 = gmm(hidden_states_sorted, w1, group_sizes)
+        gmm3 = gmm(hidden_states_sorted, w3, group_sizes)
          # Should I save silu activations?
         silu = F.silu(gmm1)
         sgmm = silu * gmm3
-        gmm2 = Gmm.gmm_no_jax_gate2(sgmm, w2, group_sizes)
-        # gmm2 = gmm(sgmm, w2, group_sizes)
+        # gmm2 = Gmm.gmm_no_jax_gate2(sgmm, w2, group_sizes)
+        gmm2 = gmm(sgmm, w2, group_sizes)
         current_hidden_states = gmm2[hidden_states_reverse_order].reshape(-1, k, n)
 
         # Exit manual sharding zone
@@ -1127,18 +1316,18 @@ class Gmm(torch.autograd.Function):
 
 
         grad_output_sorted = grad_output.reshape(-1, n)[hidden_states_order]
-        grad_output, grad_w2 = Gmm.gmm_backward_no_jax_gate2(grad_output_sorted, sgmm, w2, group_sizes)
-        # grad_output, grad_w2 = gmm_backward(grad_output_sorted, sgmm, w2, group_sizes)
+        # grad_output, grad_w2 = Gmm.gmm_backward_no_jax_gate2(grad_output_sorted, sgmm, w2, group_sizes)
+        grad_output, grad_w2 = gmm_backward(grad_output_sorted, sgmm, w2, group_sizes)
 
         grad_gmm1 = gmm3 * grad_output
         grad_gmm1 = torch.ops.aten.silu_backward(grad_gmm1, gmm1)
         
-        grad_gmm1, grad_w1 = Gmm.gmm_backward_no_jax_gate1(grad_gmm1, hidden_states_sorted, w1, group_sizes)
-        # grad_gmm1, grad_w1 = gmm_backward(grad_gmm1, hidden_states_sorted, w1, group_sizes)
+        # grad_gmm1, grad_w1 = Gmm.gmm_backward_no_jax_gate1(grad_gmm1, hidden_states_sorted, w1, group_sizes)
+        grad_gmm1, grad_w1 = gmm_backward(grad_gmm1, hidden_states_sorted, w1, group_sizes)
 
         grad_gmm3 = silu * grad_output
-        grad_gmm3, grad_w3 = Gmm.gmm_backward_no_jax_gate1(grad_gmm3, hidden_states_sorted, w3, group_sizes)
-        # grad_gmm3, grad_w3 = gmm_backward(grad_gmm3, hidden_states_sorted, w3, group_sizes)
+        # grad_gmm3, grad_w3 = Gmm.gmm_backward_no_jax_gate1(grad_gmm3, hidden_states_sorted, w3, group_sizes)
+        grad_gmm3, grad_w3 = gmm_backward(grad_gmm3, hidden_states_sorted, w3, group_sizes)
 
         grad_output = grad_gmm1 + grad_gmm3
 
