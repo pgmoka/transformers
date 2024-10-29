@@ -505,6 +505,14 @@ def main():
             ici_mesh_shape = (fsdp_axis, tensor_axis)
             dcn_mesh_shape = (dcn_axis, 1)
             logger.info(f"Multi-slice sharding: ici={ici_mesh_shape}, dcn={dcn_mesh_shape}")
+
+            # Patch _create_device_mesh_for_nd_torus
+            def create_device_mesh_for_nd_torus(self, physical_mesh, mesh_shape):
+                import jax._src.mesh_utils
+                return jax._src.mesh_utils._create_device_mesh_for_nd_torus(physical_mesh, mesh_shape, allow_split_physical_axes=True)
+
+            torch_xla.distributed.spmd.xla_sharding.HybridMesh._create_device_mesh_for_nd_torus = create_device_mesh_for_nd_torus
+
             spmd_mesh = xs.HybridMesh(ici_mesh_shape=ici_mesh_shape, dcn_mesh_shape=dcn_mesh_shape, axis_names=('fsdp', 'tensor'))
         xs.set_global_mesh(spmd_mesh)
 
@@ -541,7 +549,7 @@ def main():
         from torch_xla.distributed.fsdp import checkpoint_module
         for i, block in enumerate(model.model.layers):
             model.model.layers[i] = checkpoint_module(block)
-        # materalize all weights after 2d sharding
+        # materialize all weights after 2d sharding
         torch_xla.sync()
 
     # Preprocessing the datasets.
