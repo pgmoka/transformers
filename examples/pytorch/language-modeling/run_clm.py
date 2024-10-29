@@ -698,6 +698,11 @@ def main():
             checkpoint = training_args.resume_from_checkpoint
         elif last_checkpoint is not None:
             checkpoint = last_checkpoint
+
+        # Initialize ptxla megascale
+        torch_xla._XLAC._init_computation_client()
+        # Disable jax megascale
+        os.environ['USE_SINGLE_SLICE'] = 'true'
         train_result = trainer.train(resume_from_checkpoint=checkpoint)
         trainer.save_model()  # Saves the tokenizer too for easy upload
 
