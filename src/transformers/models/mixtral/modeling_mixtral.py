@@ -78,7 +78,7 @@ import os
 logger = logging.get_logger(__name__)
 
 _CONFIG_FOR_DOC = "MixtralConfig"
-NUM_TPU_SLICE = os.environ.get('NUM_TPU_SLICE', 1)
+NUM_TPU_SLICE = int(os.environ.get('NUM_TPU_SLICE', 1))
 
 
 def load_balancing_loss_func(
