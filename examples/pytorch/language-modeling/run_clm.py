@@ -461,8 +461,10 @@ def main():
         import psutil
         print('before model init RAM Used (GB):', psutil.virtual_memory()[3]/1000000000)
         device = torch_xla.device()
-        with device:
+        meta_device = torch.device('meta')
+        with meta_device:
             model = AutoModelForCausalLM.from_config(config, trust_remote_code=model_args.trust_remote_code)
+        # note: at this point, the mode is not materialized
         print('after model init RAM Used (GB):', psutil.virtual_memory()[3]/1000000000)
         # Set the model dtype since we can no longer rely on USE_XLA_BF16.
         if model_args.torch_dtype is not None:
@@ -517,8 +519,11 @@ def main():
         xs.set_global_mesh(spmd_mesh)
 
         # Apply sharding annotations.
-        model.to("xla")
-        for name, param in model.named_parameters():
+        dict_of_params = {}
+        for name, param in chain(model.named_parameters(), model.named_buffers()):
+            # Before `rand`, param is meta tensor. We initialize it explicitly and send to XLA.
+            param = torch.rand(param.shape, dtype=param.dtype, device='cpu').to(device)
+
             print('> [2D] Sharding tensor', name, param.shape)
 
             # Here we intentionally skip layernorm and moe.gate weights given they are small.
@@ -536,7 +541,10 @@ def main():
                 xs.mark_sharding(param, spmd_mesh, (('tensor', 'fsdp'), None))  # keep this fsdp.
 
             print(f'{name} {torch_xla._XLAC._get_xla_sharding_spec(param)}')
+            torch_xla.sync()
+            dict_of_params[name] = param
 
+        model.load_state_dict(dict_of_params, assign=True)
         for i, block in enumerate(model.model.layers):
             xs.apply_backward_optimization_barrier(model.model.layers[i])
 
