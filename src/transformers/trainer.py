@@ -2248,6 +2248,9 @@ class Trainer:
                     # with self.accelerator.accumulate(model):
                     tr_loss_step = self.training_step(model, inputs)
 
+                    if step % 10 == 0:
+                        print(f"Training step {step} : Loss: {tr_loss_step}")
+
                     if (
                         args.logging_nan_inf_filter
                         and not is_torch_xla_available()
