@@ -65,7 +65,6 @@ require_version("datasets>=2.14.0", "To fix: pip install -r examples/pytorch/lan
 
 logger = logging.getLogger(__name__)
 
-
 MODEL_CONFIG_CLASSES = list(MODEL_FOR_CAUSAL_LM_MAPPING.keys())
 MODEL_TYPES = tuple(conf.model_type for conf in MODEL_CONFIG_CLASSES)
 

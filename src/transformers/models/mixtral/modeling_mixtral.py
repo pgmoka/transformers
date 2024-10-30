@@ -78,7 +78,7 @@ import os
 logger = logging.get_logger(__name__)
 
 _CONFIG_FOR_DOC = "MixtralConfig"
-SINGLE_SLICE = os.environ.get('SINGLE_SLICE', None)
+NUM_TPU_SLICE = os.environ.get('NUM_TPU_SLICE', 1)
 
 
 def load_balancing_loss_func(
@@ -397,7 +397,7 @@ class MixtralAttention(nn.Module):
             query_states /= math.sqrt(self.head_dim)
             partition_spec = None
             if xs.get_global_mesh() is not None:
-                if SINGLE_SLICE:
+                if NUM_TPU_SLICE == 1:
                     partition_spec = ('fsdp', 'tensor', None, None)
                 else:
                     partition_spec = (('dcn','fsdp'), 'tensor', None, None)
@@ -899,7 +899,7 @@ class Gmm(torch.autograd.Function):
 
         # Enter manual sharding zone
         if xs.get_global_mesh() is not None:
-            if SINGLE_SLICE:
+            if NUM_TPU_SLICE == 1:
                 hidden_states = xs.enable_manual_sharding(hidden_states, ('fsdp', None)).global_tensor
                 top_ks = xs.enable_manual_sharding(top_ks, ('fsdp', None)).global_tensor
                 w1 = xs.enable_manual_sharding(full_w1, (None, None, 'tensor')).global_tensor
@@ -952,7 +952,7 @@ class Gmm(torch.autograd.Function):
                 # Only reduce-scatter along tensor axis.
                 current_hidden_states = torch_xla.torch_xla._XLAC._xla_spmd_reduce_scatter(xm.REDUCE_SUM, current_hidden_states, 1.0, -1, device_ids.shape[-1], device_ids.tolist())
 
-            if SINGLE_SLICE:
+            if NUM_TPU_SLICE == 1:
                 current_hidden_states = xs.disable_manual_sharding(current_hidden_states, ('fsdp', None, 'tensor'), (m, k, n)).global_tensor
                 hidden_states_sorted = xs.disable_manual_sharding(hidden_states_sorted, ('fsdp', None), (m * k, n)).global_tensor
                 gmm1 = xs.disable_manual_sharding(gmm1, ('fsdp', 'tensor'), (m * k, l)).global_tensor
@@ -996,19 +996,19 @@ class Gmm(torch.autograd.Function):
 
         # Enter manual sharding zone
         if xs.get_global_mesh() is not None:
-            if SINGLE_SLICE:
+            if NUM_TPU_SLICE == 1:
                 hidden_states_sorted = xs.enable_manual_sharding(hidden_states_sorted, ('fsdp', None)).global_tensor
             else:
                 hidden_states_sorted = xs.enable_manual_sharding(hidden_states_sorted, (('dcn', 'fsdp'), None)).global_tensor
             w1 = xs.enable_manual_sharding(full_w1, (None, None, 'tensor')).global_tensor
             w2 = xs.enable_manual_sharding(full_w2, (None, 'tensor', None)).global_tensor
             w3 = xs.enable_manual_sharding(full_w3, (None, None, 'tensor')).global_tensor
-            temp_sharding_spec = ('fsdp', 'tensor') if SINGLE_SLICE else (('dcn', 'fsdp'), 'tensor')
+            temp_sharding_spec = ('fsdp', 'tensor') if NUM_TPU_SLICE == 1 else (('dcn', 'fsdp'), 'tensor')
             gmm1 = xs.enable_manual_sharding(gmm1, temp_sharding_spec).global_tensor
             gmm3 = xs.enable_manual_sharding(gmm3, temp_sharding_spec).global_tensor
             silu = xs.enable_manual_sharding(silu, temp_sharding_spec).global_tensor
             sgmm = xs.enable_manual_sharding(sgmm, temp_sharding_spec).global_tensor
-            if SINGLE_SLICE:
+            if NUM_TPU_SLICE == 1:
                 grad_output = xs.enable_manual_sharding(grad_output, ('fsdp', None, None)).global_tensor
             else:
                 grad_output = xs.enable_manual_sharding(grad_output, (('dcn', 'fsdp'), None, None)).global_tensor
@@ -1033,7 +1033,7 @@ class Gmm(torch.autograd.Function):
         if xs.get_global_mesh() is not None:
             if not hasattr(ctx, "device_ids"):
                 # Here we do a manual reduce scatter as SPMD will not be able to infer this after the manual sharding zone.
-                if SINGLE_SLICE:
+                if NUM_TPU_SLICE == 1:
                     groups = [xs.get_global_mesh().device_ids]  # a single group across the whole world
                 else:
                     groups = [list(range(0, 256)), list(range(256, 512))]
@@ -1042,19 +1042,15 @@ class Gmm(torch.autograd.Function):
                 grad_w2 = torch_xla.torch_xla._XLAC._xla_spmd_reduce_scatter(xm.REDUCE_SUM, grad_w2, 1 / world_size, -2, world_size, groups)
                 grad_w3 = torch_xla.torch_xla._XLAC._xla_spmd_reduce_scatter(xm.REDUCE_SUM, grad_w3, 1 / world_size, -1, world_size, groups)
 
-                if SINGLE_SLICE:
+                if NUM_TPU_SLICE == 1:
                     grad_output = xs.disable_manual_sharding(grad_output, ('fsdp', None), (m, n)).global_tensor
                 else:
                     grad_output = xs.disable_manual_sharding(grad_output, (('dcn', 'fsdp'), None), (m, n)).global_tensor
                 # TODO: make the 0s more programmatic.
-                if SINGLE_SLICE:
-                    grad_w1 = xs.disable_manual_sharding(grad_w1, (None, None, 'fsdp'), w1.shape).global_tensor
-                    grad_w2 = xs.disable_manual_sharding(grad_w2, (None, 'fsdp', None), w2.shape).global_tensor
-                    grad_w3 = xs.disable_manual_sharding(grad_w3, (None, None, 'fsdp'), w3.shape).global_tensor
-                else:
-                    grad_w1 = xs.disable_manual_sharding(grad_w1, (None, None,  'fsdp'), w1.shape).global_tensor
-                    grad_w2 = xs.disable_manual_sharding(grad_w2, (None,  'fsdp', None), w2.shape).global_tensor
-                    grad_w3 = xs.disable_manual_sharding(grad_w3, (None, None, 'fsdp'), w3.shape).global_tensor
+                # grad_w* sharding isn't affected by multipod.
+                grad_w1 = xs.disable_manual_sharding(grad_w1, (None, None,  'fsdp'), w1.shape).global_tensor
+                grad_w2 = xs.disable_manual_sharding(grad_w2, (None,  'fsdp', None), w2.shape).global_tensor
+                grad_w3 = xs.disable_manual_sharding(grad_w3, (None, None, 'fsdp'), w3.shape).global_tensor
             else:  # 2d sharding
                 device_ids = ctx.device_ids
 

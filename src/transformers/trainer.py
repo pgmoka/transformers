@@ -238,7 +238,7 @@ if is_accelerate_available():
 if is_accelerate_available("0.28.0"):
     from accelerate.utils import DataLoaderConfiguration
 
-SINGLE_SLICE=os.environ.get('SINGLE_SLICE', None)
+NUM_TPU_SLICE = os.environ.get('NUM_TPU_SLICE', 1)
 
 def _is_peft_model(model):
     if is_peft_available():
@@ -682,19 +682,20 @@ class Trainer:
             # Prepare the SPMD mesh that is going to be used by the data loader and the FSDPv2 wrapper.
             # Tensor axis is just a placeholder where it will not be used in FSDPv2.
             num_devices = xr.global_runtime_device_count()
-            if SINGLE_SLICE:
+            if NUM_TPU_SLICE == 1:
                 mesh_shape = (num_devices, 1)
                 device_ids = np.array(range(num_devices))
                 # To be noted, the mesh must have an axis named 'fsdp', which the weights and activations will be sharded on.
                 mesh = xs.Mesh(device_ids, mesh_shape, ('fsdp', 'tensor'))
                 xs.set_global_mesh(mesh)
-            else:
-                dcn_axis = 2
+            elif NUM_TPU_SLICE > 1:
+                dcn_axis = NUM_TPU_SLICE
                 ici_mesh_shape = (1, num_devices // dcn_axis, 1)
                 dcn_mesh_shape = (dcn_axis, 1, 1)
                 mesh = xs.HybridMesh(ici_mesh_shape=ici_mesh_shape, dcn_mesh_shape=dcn_mesh_shape, axis_names=('dcn', 'fsdp', 'tensor'))
                 xs.set_global_mesh(mesh)
-            # xs.set_global_mesh(xs.Mesh(np.array(range(num_devices)), (num_devices, 1), axis_names=("fsdp", "tensor")))
+            else:
+                raise ValueError("Expected NUM_TPU_SLICE > 0")
 
     def _activate_neftune(self, model):
         r"""
@@ -1725,7 +1726,7 @@ class Trainer:
 
                     if real_output is None:
                         raise ValueError("Something went wrong, the output of the model shouldn't be `None`")
-                    if SINGLE_SLICE:
+                    if NUM_TPU_SLICE == 1:
                         xs.mark_sharding(real_output, mesh, ("fsdp", None, None))
                     else:
                         xs.mark_sharding(real_output, mesh, (("dcn", "fsdp"), None, None))
@@ -1915,7 +1916,7 @@ class Trainer:
         train_dataloader = self.get_train_dataloader()
         if self.is_fsdp_xla_v2_enabled:
             # train_dataloader = tpu_spmd_dataloader(train_dataloader)
-            if SINGLE_SLICE:
+            if NUM_TPU_SLICE == 1:
                 sharding_spec = xs.ShardingSpec(xs.get_global_mesh(), ("fsdp", None))
             else:
                 sharding_spec = xs.ShardingSpec(xs.get_global_mesh(), (("dcn", "fsdp"), None))
