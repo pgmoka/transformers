@@ -549,8 +549,19 @@ def main():
         from torch_xla.distributed.fsdp import checkpoint_module
         for i, block in enumerate(model.model.layers):
             model.model.layers[i] = checkpoint_module(block)
+
+        import torch_xla.debug.metrics as met
+        print("=================== Start metrics before materializing model ===================")
+        print(met.metrics_report())
+        print("=================== End metrics before materializing model ===================")
+
         # materialize all weights after 2d sharding
         torch_xla.sync()
+
+        import torch_xla.debug.metrics as met
+        print("=================== Start metrics after materializing model ===================")
+        print(met.metrics_report())
+        print("=================== End metrics after materializing model ===================")
 
     # Preprocessing the datasets.
     # First we tokenize all the texts.
