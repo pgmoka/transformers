@@ -542,11 +542,6 @@ def main():
 
             print(f'{name} {torch_xla._XLAC._get_xla_sharding_spec(param)}')
             torch_xla.sync()
-
-            # See https://github.com/huggingface/transformers/issues/34234.
-            if "rotary_emb.inv_freq" in name:
-                # Otherwise, we get error: Unexpected key(s) in state_dict: "model.layers.0.self_attn.rotary_emb.inv_freq",
-                continue
             dict_of_params[name] = param
 
         model.load_state_dict(dict_of_params, assign=True)
