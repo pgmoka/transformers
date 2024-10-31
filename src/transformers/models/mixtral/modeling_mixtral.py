@@ -1036,7 +1036,7 @@ class Gmm(torch.autograd.Function):
                 if NUM_TPU_SLICE == 1:
                     groups = [xs.get_global_mesh().device_ids]  # a single group across the whole world
                 else:
-                    groups = [list(range(0, 256)), list(range(256, 512))]
+                    groups = [list(range(i*256, (i+1)*256)) for i in range(NUM_TPU_SLICE)]
                 world_size = len(groups[0])
                 grad_w1 = torch_xla.torch_xla._XLAC._xla_spmd_reduce_scatter(xm.REDUCE_SUM, grad_w1, 1 / world_size, -1, world_size, groups)
                 grad_w2 = torch_xla.torch_xla._XLAC._xla_spmd_reduce_scatter(xm.REDUCE_SUM, grad_w2, 1 / world_size, -2, world_size, groups)
