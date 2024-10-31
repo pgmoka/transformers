@@ -550,6 +550,7 @@ def main():
             dict_of_params[name] = param
 
         model.load_state_dict(dict_of_params, assign=True)
+        model.to('xla')
         for i, block in enumerate(model.model.layers):
             xs.apply_backward_optimization_barrier(model.model.layers[i])
 
