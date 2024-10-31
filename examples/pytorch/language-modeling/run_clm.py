@@ -501,21 +501,23 @@ def main():
             spmd_mesh = xs.Mesh(range(num_devices), mesh_shape, ('fsdp', 'tensor'))
         else:
             # Multi-slice 2D sharding
-            dcn_axis = 2
             tensor_axis = model_args.spmd_2d_sharding
-            fsdp_axis = num_devices // tensor_axis // dcn_axis
-            ici_mesh_shape = (fsdp_axis, tensor_axis)
+            fsdp_axis = num_devices // tensor_axis
+            mesh_shape = (fsdp_axis, tensor_axis)  # Should be (128, 4)
+            logger.info(f"Multi-slice sharding: mesh={mesh_shape}")
+            dcn_axis = 2
+            ici_fsdp_axis = num_devices // tensor_axis // dcn_axis
+            ici_mesh_shape = (ici_fsdp_axis, tensor_axis)
             dcn_mesh_shape = (dcn_axis, 1)
-            logger.info(f"Multi-slice sharding: ici={ici_mesh_shape}, dcn={dcn_mesh_shape}")
-
-            # Patch _create_device_mesh_for_nd_torus
-            def create_device_mesh_for_nd_torus(self, physical_mesh, mesh_shape):
-                import jax._src.mesh_utils
-                return jax._src.mesh_utils._create_device_mesh_for_nd_torus(physical_mesh, mesh_shape, allow_split_physical_axes=True)
-
-            torch_xla.distributed.spmd.xla_sharding.HybridMesh._create_device_mesh_for_nd_torus = create_device_mesh_for_nd_torus
-
-            spmd_mesh = xs.HybridMesh(ici_mesh_shape=ici_mesh_shape, dcn_mesh_shape=dcn_mesh_shape, axis_names=('fsdp', 'tensor'))
+            import _hybrid_mesh
+            devices = _hybrid_mesh.get_hybrid_mesh(
+                ici_mesh_shape=ici_mesh_shape,
+                dcn_mesh_shape=dcn_mesh_shape,
+                num_devices=num_devices,
+                num_slices=dcn_axis,
+            )
+            assert len(devices) == num_devices
+            spmd_mesh = xs.Mesh(devices, mesh_shape, ('fsdp', 'tensor'))
         xs.set_global_mesh(spmd_mesh)
 
         # Apply sharding annotations.
