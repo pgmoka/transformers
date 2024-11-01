@@ -480,10 +480,9 @@ def main():
 
     # Check if we are running in multi-slice mode.
     device_attributes = xr.global_runtime_device_attributes()
-    is_single_slice = 'slice_index' not in device_attributes[0]
-    is_multi_slice = not is_single_slice
+    num_slices = max(int(d.get('slice_index', 0)) for d in device_attributes) + 1
 
-    if is_multi_slice and model_args.spmd_2d_sharding == 0:
+    if num_slices > 1 and model_args.spmd_2d_sharding == 0:
         raise ValueError("Multi-slice training requires SPMD 2D sharding")
 
     # Apply 2D sharding.
@@ -492,7 +491,7 @@ def main():
     # model on device.
     if model_args.spmd_2d_sharding > 0:
         num_devices = xr.global_runtime_device_count()
-        if is_single_slice:
+        if num_slices == 1:
             # Single-slice 2D sharding
             tensor_axis = model_args.spmd_2d_sharding
             fsdp_axis = num_devices // tensor_axis
@@ -505,7 +504,7 @@ def main():
             fsdp_axis = num_devices // tensor_axis
             mesh_shape = (fsdp_axis, tensor_axis)  # Should be (128, 4)
             logger.info(f"Multi-slice sharding: mesh={mesh_shape}")
-            dcn_axis = 2
+            dcn_axis = num_slices
             ici_fsdp_axis = num_devices // tensor_axis // dcn_axis
             ici_mesh_shape = (ici_fsdp_axis, tensor_axis)
             dcn_mesh_shape = (dcn_axis, 1)
