@@ -485,6 +485,11 @@ def main():
     if num_slices > 1 and model_args.spmd_2d_sharding == 0:
         raise ValueError("Multi-slice training requires SPMD 2D sharding")
 
+    import torch_xla.debug.metrics as met
+    print("=================== Start metrics before materializing model ===================")
+    print(met.metrics_report())
+    print("=================== End metrics before materializing model ===================")
+
     # Apply 2D sharding.
     # We apply sharding annotations before running the tokenizer, since
     # `training_args.main_process_first` may involve a `mark_step` which will materialize the
@@ -560,18 +565,13 @@ def main():
         for i, block in enumerate(model.model.layers):
             model.model.layers[i] = checkpoint_module(block)
 
-        import torch_xla.debug.metrics as met
-        print("=================== Start metrics before materializing model ===================")
-        print(met.metrics_report())
-        print("=================== End metrics before materializing model ===================")
-
         # materialize all weights after 2d sharding
         torch_xla.sync()
 
-        import torch_xla.debug.metrics as met
-        print("=================== Start metrics after materializing model ===================")
-        print(met.metrics_report())
-        print("=================== End metrics after materializing model ===================")
+    import torch_xla.debug.metrics as met
+    print("=================== Start metrics after materializing model ===================")
+    print(met.metrics_report())
+    print("=================== End metrics after materializing model ===================")
 
     # Preprocessing the datasets.
     # First we tokenize all the texts.
