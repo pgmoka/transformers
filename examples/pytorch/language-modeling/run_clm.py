@@ -68,6 +68,19 @@ logger = logging.getLogger(__name__)
 MODEL_CONFIG_CLASSES = list(MODEL_FOR_CAUSAL_LM_MAPPING.keys())
 MODEL_TYPES = tuple(conf.model_type for conf in MODEL_CONFIG_CLASSES)
 
+from torch_xla.experimental.stablehlo_custom_call import place_to_device, place_to_host
+
+
+class OffloadingModule(torch.nn.Module):
+
+    def __init__(self, m):
+        super().__init__()
+        self.m = m
+
+    def forward(self, *args, **kwargs):
+        with torch.autograd.saved_tensors_hooks(place_to_host, place_to_device):
+            return self.m(*args, **kwargs)
+
 
 @dataclass
 class ModelArguments:
@@ -460,9 +473,13 @@ def main():
     else:
         import psutil
         print('before model init RAM Used (GB):', psutil.virtual_memory()[3]/1000000000)
-        device = torch_xla.device()
-        with device:
+        meta_device = torch.device('meta')
+        with meta_device:
             model = AutoModelForCausalLM.from_config(config, trust_remote_code=model_args.trust_remote_code)
+        # note: at this point, the mode is not 
+        device = torch_xla.device()
+        # with device:
+        #     model = AutoModelForCausalLM.from_config(config, trust_remote_code=model_args.trust_remote_code)
         print('after model init RAM Used (GB):', psutil.virtual_memory()[3]/1000000000)
         # Set the model dtype since we can no longer rely on USE_XLA_BF16.
         if model_args.torch_dtype is not None:
@@ -488,8 +505,15 @@ def main():
         spmd_mesh = xs.Mesh(range(num_devices), mesh_shape, ('fsdp', 'tensor'))
         xs.set_global_mesh(spmd_mesh)
 
-        model.to("xla")
-        for name, param in model.named_parameters():
+        # model.to("xla")
+        dict_of_params = {}
+        for name, param in (model.named_parameters() + model.named_buffers()):
+
+            # AT this point, param is meta tensor
+
+            param = torch.rand(param.shape, dtype=param.dtype, device='cpu').to(device)
+
+
             print('> [2D] Sharding tensor', name, param.shape)
 
             # Here we intentionally skip layernorm and moe.gate weights given they are small.
@@ -507,7 +531,9 @@ def main():
                 xs.mark_sharding(param, spmd_mesh, (('tensor', 'fsdp'), None))  # keep this fsdp.
 
             print(f'{name} {torch_xla._XLAC._get_xla_sharding_spec(param)}')
+            dict_of_params[name] = param
 
+        model.load_state_dict(dict_of_params, assign=True)
         for i, block in enumerate(model.model.layers):
             xs.apply_backward_optimization_barrier(model.model.layers[i])
 
@@ -518,10 +544,27 @@ def main():
             )
             model.config.use_cache = False
         from torch_xla.distributed.fsdp import checkpoint_module
-        for i, block in enumerate(model.model.layers):
-            model.model.layers[i] = checkpoint_module(block)
-        # materalize all weights after 2d sharding
+        # for i, block in enumerate(model.model.layers):
+        #     model.model.layers[i] = checkpoint_module(block)
+
+        from transformers.models.llama import modeling_llama
+
+        def replace_layer(module):
+            for n, m in module.named_modules():
+                new_m = None
+                if isinstance(m, modeling_llama.LlamaAttention):
+                    new_m = OffloadingModule(m)
+                if isinstance(m, modeling_llama.LlamaMLP):
+                    new_m = checkpoint_module(m)
+                if new_m is not None:
+                    setattr(module, n, new_m)
+        
+        model.model.apply(replace_layer)
+
+
+
         torch_xla.sync()
+        # materalize all weights after 2d sharding
 
     # Preprocessing the datasets.
     # First we tokenize all the texts.
