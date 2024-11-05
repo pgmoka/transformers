@@ -168,6 +168,14 @@ class ModelArguments:
             )
         },
     )
+    remat_every: int = field(
+        default=1,
+        metadata={
+            "help": (
+                "Remat every N layers. Default is to remat every layer (1). A value of zero will disable remat. A value of 2 will remat every other layer."
+            )
+        },
+    )
 
     def __post_init__(self):
         if self.config_overrides is not None and (self.config_name is not None or self.model_name_or_path is not None):
@@ -555,15 +563,19 @@ def main():
         for i, block in enumerate(model.model.layers):
             xs.apply_backward_optimization_barrier(model.model.layers[i])
 
-        print("Applying gradient checkpointing")
-        if model.config.use_cache:
-            logger.warning_once(
-                "`use_cache=True` is incompatible with gradient checkpointing. Setting `use_cache=False`."
-            )
-            model.config.use_cache = False
-        from torch_xla.distributed.fsdp import checkpoint_module
-        for i, block in enumerate(model.model.layers):
-            model.model.layers[i] = checkpoint_module(block)
+        if model_args.remat_every > 0:
+            print(f"Applying gradient checkpointing to every {model_args.remat_every} layer")
+            if model.config.use_cache:
+                logger.warning_once(
+                    "`use_cache=True` is incompatible with gradient checkpointing. Setting `use_cache=False`."
+                )
+                model.config.use_cache = False
+            from torch_xla.distributed.fsdp import checkpoint_module
+            for i, block in enumerate(model.model.layers):
+                if i % model_args.remat_every == 0:
+                    model.model.layers[i] = checkpoint_module(block)
+        else:
+            print("Not applying gradient checkpointing")
 
         # materialize all weights after 2d sharding
         torch_xla.sync()
