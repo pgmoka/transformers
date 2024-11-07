@@ -32,6 +32,10 @@ from typing import Optional
 import datasets
 import evaluate
 import torch
+from torch.autograd.graph import saved_tensors_hooks
+from torch_xla.experimental.stablehlo_custom_call import (
+  place_to_host, place_to_device
+)
 from datasets import load_dataset
 
 import transformers
@@ -67,6 +71,17 @@ logger = logging.getLogger(__name__)
 
 MODEL_CONFIG_CLASSES = list(MODEL_FOR_CAUSAL_LM_MAPPING.keys())
 MODEL_TYPES = tuple(conf.model_type for conf in MODEL_CONFIG_CLASSES)
+
+
+class OffloadingModule(torch.nn.Module):
+
+    def __init__(self, m):
+        super().__init__()
+        self.m = m
+
+    def forward(self, *args, **kwargs):
+        with saved_tensors_hooks(place_to_host, place_to_device):
+            return self.m(*args, **kwargs)
 
 
 @dataclass
@@ -570,10 +585,11 @@ def main():
                     "`use_cache=True` is incompatible with gradient checkpointing. Setting `use_cache=False`."
                 )
                 model.config.use_cache = False
+
             from torch_xla.distributed.fsdp import checkpoint_module
             for i, block in enumerate(model.model.layers):
                 if i % model_args.remat_every == 0:
-                    model.model.layers[i] = checkpoint_module(block)
+                    model.model.layers[i] = OffloadingModule(checkpoint_module(block))
         else:
             print("Not applying gradient checkpointing")
 
