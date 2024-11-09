@@ -852,6 +852,7 @@ class MixtralSparseMoeBlock(nn.Module):
         self.top_k = config.num_experts_per_tok
         self.static = config.static
         self.capacity_factor = config.capacity_factor
+        self.reuse_hidden_states = False
 
         # gating
         self.gate = nn.Linear(self.hidden_dim, self.num_experts, bias=False)
@@ -942,30 +943,33 @@ class MixtralSparseMoeBlock(nn.Module):
         routing_weights = routing_weights.to(hidden_states.dtype)
 
 
+        final_hidden_states = torch.zeros(
+            (batch_size * sequence_length, hidden_dim), dtype=hidden_states.dtype, device=hidden_states.device
+        )
         if self.capacity_factor > 0:
-            logger.info(
+            logger.warning_once(
                 f"apply dropped implementation with capacity_factor={self.capacity_factor}"
+            )
+            logger.warning_once(
+                f"{self.reuse_hidden_states=}."
             )
             top_k_indices = selected_experts.reshape(batch_size, sequence_length, self.top_k)
             _, token_mask, top_k_weight_mask = self.generate_masks(top_k_indices)
             routing_weights *= top_k_weight_mask.reshape((batch_size * sequence_length), self.top_k)
 
-            # https://github.com/huggingface/transformers/blob/v4.44.2/src/transformers/models/switch_transformers/modeling_switch_transformers.py#L296
-            # The routers introduced might not always map all the tokens, to a router, which means that some hidden states
-            # can be unchanged from one layer to another. That is why the hidden states are cloned before updating only the seleced ones.
-            final_hidden_states = hidden_states.view(batch_size, sequence_length, hidden_dim).clone()
+            if self.reuse_hidden_states:
+                # https://github.com/huggingface/transformers/blob/v4.44.2/src/transformers/models/switch_transformers/modeling_switch_transformers.py#L296
+                # The routers introduced might not always map all the tokens, to a router, which means that some hidden states
+                # can be unchanged from one layer to another. That is why the hidden states are cloned before updating only the seleced ones.
+                final_hidden_states = hidden_states.view(batch_size, sequence_length, hidden_dim).clone()
 
-            # mask as 0 if the selected token would be assigned to at least one expert
-            # reuse previous hidden states otherwise
-            # token_mask: (batch_size, sequence_length)
-            token_mask = token_mask.unsqueeze(-1)
-            final_hidden_states = final_hidden_states.masked_fill(token_mask, 0.0)
+                # mask as 0 if the selected token would be assigned to at least one expert
+                # reuse previous hidden states otherwise
+                # token_mask: (batch_size, sequence_length)
+                token_mask = token_mask.unsqueeze(-1)
+                final_hidden_states = final_hidden_states.masked_fill(token_mask, 0.0)
 
-            final_hidden_states = final_hidden_states.reshape(batch_size * sequence_length, hidden_dim)
-        else:
-            final_hidden_states = torch.zeros(
-                (batch_size * sequence_length, hidden_dim), dtype=hidden_states.dtype, device=hidden_states.device
-            )
+                final_hidden_states = final_hidden_states.reshape(batch_size * sequence_length, hidden_dim)
 
         # One hot encode the selected experts to create an expert mask
         # this will be used to easily index which expert is going to be sollicitated
