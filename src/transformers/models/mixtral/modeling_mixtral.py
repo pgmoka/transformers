@@ -831,6 +831,42 @@ class MixtralBlockSparseTop2MLP(nn.Module):
         return current_hidden_states
 
 
+class MixtralExpertParallelTop2MLP(nn.Module):
+    def __init__(self, config: MixtralConfig):
+        super().__init__()
+        self.ffn_dim = config.intermediate_size
+        self.hidden_dim = config.hidden_size
+        self.num_experts = config.num_local_experts
+
+        self.w1 = nn.Parameter(torch.empty(self.num_experts, self.hidden_dim, self.ffn_dim))
+        self.w2 = nn.Parameter(torch.empty(self.num_experts, self.ffn_dim, self.hidden_dim))
+        self.w3 = nn.Parameter(torch.empty(self.num_experts, self.hidden_dim, self.ffn_dim))
+
+        self.act_fn = ACT2FN[config.hidden_act]
+
+        self.mesh = xs.get_global_mesh()
+        xs.mark_sharding(self.w1, self.mesh, ('expert', None, None))
+        xs.mark_sharding(self.w2, self.mesh, ('expert', None, None))
+        xs.mark_sharding(self.w3, self.mesh, ('expert', None, None))
+
+        self.reset_parameters()
+    
+    def forward(self, dispatch_input):
+        layer_w1 = torch.einsum("ebcm,emh->ebch", dispatch_input, self.w1)
+        xs.mark_sharding(layer_w1, self.mesh, ('expert', 'fsdp', None, None))
+        # TODO(bbahl): checkpoint intermediate tensor layer_w1
+
+        layer_w3 = torch.einsum("ebcm,emh->ebch", dispatch_input, self.w3)
+        xs.mark_sharding(layer_w3, self.mesh, ('expert', 'fsdp', None, None))
+        # TODO(bbahl): checkpoint intermediate tensor layer_w3
+
+        layer_multiply = self.act_fn(layer_w1) * layer_w3
+
+        intermediate_layer = torch.einsum("ebch,ehm->ebcm", layer_multiply, self.w2)
+        xs.mark_sharding(intermediate_layer, self.mesh, ('expert', 'fsdp', None, None))
+        # TODO(bbahl): checkpoint intermediate_layer
+        return intermediate_layer
+
 class MixtralBLockSparseTop2MLP(MixtralBlockSparseTop2MLP):
     def __init__(self, *args, **kwargs):
         logger.warning_once(
@@ -1121,22 +1157,26 @@ class MixtralSparseMoeBlock(nn.Module):
         self.static = config.static
         self.gmm = config.gmm
         self.gmm_stack = config.gmm_stack
+        self.capacity_factor = config.capacity_factor
 
         # gating
         self.gate = nn.Linear(self.hidden_dim, self.num_experts, bias=False)
-        if not self.gmm or self.gmm_stack:
+        if self.capacity_factor > 0:
+            self.experts = MixtralExpertParallelTop2MLP(config)
+        elif not self.gmm or self.gmm_stack:
             self.experts = nn.ModuleList([MixtralBlockSparseTop2MLP(config) for _ in range(self.num_experts)])
         else:
             self.experts = MixtralGmmTop2MLP(config)
 
         # Jitter parameters
         self.jitter_noise = config.router_jitter_noise
-        self.capacity_factor = config.capacity_factor
+        
 
-    def generate_masks(self, top_k_indices, softmax_probs):
+    def generate_masks(self, top_k_indices, softmax_probs, mesh):
         # calculate expert_capacity = (tokens_per_batch / num_experts) * capacity_factor
-        mesh = xs.get_global_mesh()
         batch_size, seq_len, _ = top_k_indices.shape
+        top_k_indices = top_k_indices.view(batch_size, seq_len, self.num_experts)
+        softmax_probs = softmax_probs.view(batch_size, seq_len, self.num_experts)
         tokens_per_batch = seq_len * self.top_k
         expert_capacity_per_batch = int((tokens_per_batch / self.num_experts) * self.capacity_factor)
         print(f"Applying potential token dropping with a batch expert_capacity of {expert_capacity_per_batch}")
@@ -1183,16 +1223,31 @@ class MixtralSparseMoeBlock(nn.Module):
         # router_logits: (batch * sequence_length, n_experts)
         router_logits = self.gate(hidden_states)
 
-        routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
-        routing_weights, selected_experts = torch.topk(routing_weights, self.top_k, dim=-1)
+        expert_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
+        routing_weights, selected_experts = torch.topk(expert_weights, self.top_k, dim=-1)
         routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
         # we cast back to the input dtype
         routing_weights = routing_weights.to(hidden_states.dtype)
 
         if not self.gmm and not self.gmm_stack:
             if self.capacity_factor > 0:
-                pass
-                
+                mesh = xs.get_global_mesh()
+                dispatch_mask, combine_mask = self.generate_masks(selected_experts, expert_weights, mesh)
+                mask_axes = (('fsdp', 'expert'), None, None, None)
+                xs.mark_sharding(dispatch_mask, mesh, mask_axes)
+                xs.mark_sharding(combine_mask, mesh, mask_axes)
+
+                # TODO(bbahl): Implement loss function correctly
+                #loss = self.load_balance_loss(top_k_indices, softmax_probs)
+
+                xs.mark_sharding(hidden_states, mesh, (('fsdp', 'expert'), None, None, None))
+                dispatch = torch.einsum("bsm,bsec->ebcm", hidden_states, dispatch_mask)
+                xs.mark_sharding(dispatch, mesh, ('expert', 'fsdp', None, None))
+
+                expert_layer = self.experts(dispatch)
+                output = torch.einsum("ebcm,bsec -> bsm", expert_layer, combine_mask)
+                xs.mark_sharding(output, mesh, (('fsdp', 'expert', None, None)))
+                return output, router_logits
 
             final_hidden_states = torch.zeros(
                 (batch_size * sequence_length, hidden_dim), dtype=hidden_states.dtype, device=hidden_states.device
