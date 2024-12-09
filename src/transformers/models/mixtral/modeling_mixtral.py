@@ -28,6 +28,7 @@ import torch.nn.functional as F
 import torch.utils.checkpoint
 from torch import nn
 from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss, init
+import torch_xla.distributed.spmd as xs
 
 from ...activations import ACT2FN
 from ...cache_utils import Cache, DynamicCache
@@ -1130,6 +1131,47 @@ class MixtralSparseMoeBlock(nn.Module):
 
         # Jitter parameters
         self.jitter_noise = config.router_jitter_noise
+        self.capacity_factor = config.capacity_factor
+
+    def generate_masks(self, top_k_indices, softmax_probs):
+        # calculate expert_capacity = (tokens_per_batch / num_experts) * capacity_factor
+        mesh = xs.get_global_mesh()
+        batch_size, seq_len, _ = top_k_indices.shape
+        tokens_per_batch = seq_len * self.top_k
+        expert_capacity_per_batch = int((tokens_per_batch / self.num_experts) * self.capacity_factor)
+        print(f"Applying potential token dropping with a batch expert_capacity of {expert_capacity_per_batch}")
+
+        # calculate expert mask and drop tokens if needed
+        # shape of output expert mask: (batch, sequence, num_experts_per_tok)
+        expert_mask = F.one_hot(top_k_indices, num_classes=self.num_experts).to(torch.int32)
+        expert_mask_fused = expert_mask.view(batch_size, seq_len * self.top_k, self.num_experts)
+        xs.mark_sharding(expert_mask_fused, mesh, (('fsdp', 'expert'), None, None))
+        
+        expert_token_count_fused = torch.cumsum(expert_mask_fused, dim=1)
+        expert_token_count = expert_token_count_fused.view(batch_size, seq_len, self.top_k, self.num_experts)
+        xs.mark_sharding(expert_token_count, mesh, (('fsdp', 'expert'), None, None, None))
+        
+        trunc_expert_mask = expert_mask * (expert_token_count <= expert_capacity_per_batch).to(torch.int32)
+        combined_expert_mask = trunc_expert_mask.sum(dim=2)
+        
+        # reshape & update weights
+        softmax_probs *= combined_expert_mask
+
+        # calculate token position in expert capacity dimension
+        expert_token_position_fused = expert_mask_fused * expert_token_count_fused
+        expert_token_position = expert_token_position_fused.view(batch_size, seq_len, self.top_k, self.num_experts)
+        combined_expert_token_position = expert_token_position.sum(dim=2) * combined_expert_mask
+        
+        expert_token_position_in_capacity = F.one_hot(
+            combined_expert_token_position, num_classes=expert_capacity_per_batch + 1).to(torch.int32)
+
+        # shape of combine_mask is (batch_size, seq_len, num_experts, expert_capacity_per_batch + 1),
+        # and cut 0-dimension which is always 0
+        combine_mask = softmax_probs.unsqueeze(-1) * expert_token_position_in_capacity
+        combine_mask = combine_mask[..., 1:]
+        dispatch_mask = combine_mask.bool()
+
+        return dispatch_mask, combine_mask
 
     @xp.trace_me("MixtralSparseMoeBlock")
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -1148,6 +1190,10 @@ class MixtralSparseMoeBlock(nn.Module):
         routing_weights = routing_weights.to(hidden_states.dtype)
 
         if not self.gmm and not self.gmm_stack:
+            if self.capacity_factor > 0:
+                pass
+                
+
             final_hidden_states = torch.zeros(
                 (batch_size * sequence_length, hidden_dim), dtype=hidden_states.dtype, device=hidden_states.device
             )

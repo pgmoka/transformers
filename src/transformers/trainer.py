@@ -239,6 +239,7 @@ if is_accelerate_available("0.28.0"):
     from accelerate.utils import DataLoaderConfiguration
 
 NUM_TPU_SLICE = int(os.environ.get('NUM_TPU_SLICE', 1))
+USE_EXPERT_PARALLELISM = bool(os.environ.get('USE_EXPERT_PARALLELISM', 0))
 
 def _is_peft_model(model):
     if is_peft_available():
@@ -683,11 +684,19 @@ class Trainer:
             # Tensor axis is just a placeholder where it will not be used in FSDPv2.
             num_devices = xr.global_runtime_device_count()
             if NUM_TPU_SLICE == 1:
-                mesh_shape = (num_devices, 1)
-                device_ids = np.array(range(num_devices))
-                # To be noted, the mesh must have an axis named 'fsdp', which the weights and activations will be sharded on.
-                mesh = xs.Mesh(device_ids, mesh_shape, ('fsdp', 'tensor'))
-                xs.set_global_mesh(mesh)
+                if USE_EXPERT_PARALLELISM:
+                    num_experts = 8
+                    assert num_devices >= num_experts, "num_devices should be greater than num_experts for expert parallelism"
+                    mesh_shape = (num_devices // num_experts, num_experts, 1)
+                    device_ids = np.array(range(num_devices))
+                    mesh = xs.Mesh(device_ids, mesh_shape, ('fsdp', 'expert', 'tensor'))
+                    xs.set_global_mesh(mesh)
+                else:
+                    mesh_shape = (num_devices, 1)
+                    device_ids = np.array(range(num_devices))
+                    # To be noted, the mesh must have an axis named 'fsdp', which the weights and activations will be sharded on.
+                    mesh = xs.Mesh(device_ids, mesh_shape, ('fsdp', 'tensor'))
+                    xs.set_global_mesh(mesh)
             elif NUM_TPU_SLICE > 1:
                 dcn_axis = NUM_TPU_SLICE
                 ici_mesh_shape = (1, num_devices // dcn_axis, 1)
