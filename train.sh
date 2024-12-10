@@ -1,5 +1,7 @@
 #!/bin/bash
 
+pip install .
+
 python3 examples/pytorch/language-modeling/run_clm.py \
   --dataset_name wikitext \
   --dataset_config_name wikitext-2-raw-v1 \
@@ -20,4 +22,4 @@ python3 examples/pytorch/language-modeling/run_clm.py \
   --dataloader_drop_last yes \
   --flash_attention \
   --num_train_epochs 1 \
-  --gmm
+  --static

@@ -1,4 +1,7 @@
 #!/bin/bash
+cd transformers
+pip3 install git+file://$PWD
+pip3 install accelerate datasets evaluate scikit-learn huggingface-hub
 pip3 install torch==2.6.0.dev20241209+cpu.cxx11.abi --index-url https://download.pytorch.org/whl/nightly
 wget https://storage.googleapis.com/pytorch-xla-releases/wheels/tpuvm/torch_xla-2.6.0.dev20241209.cxx11-cp310-cp310-linux_x86_64.whl
 mv torch_xla-2.6.0.dev20241209.cxx11-cp310-cp310-linux_x86_64.whl torch_xla-2.6.0.dev20241209-cp310-cp310-linux_x86_64.whl

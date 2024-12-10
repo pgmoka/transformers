@@ -685,7 +685,7 @@ class Trainer:
             num_devices = xr.global_runtime_device_count()
             if NUM_TPU_SLICE == 1:
                 if USE_EXPERT_PARALLELISM:
-                    num_experts = 8
+                    num_experts = 2
                     assert num_devices >= num_experts, "num_devices should be greater than num_experts for expert parallelism"
                     mesh_shape = (num_devices // num_experts, num_experts, 1)
                     device_ids = np.array(range(num_devices))
