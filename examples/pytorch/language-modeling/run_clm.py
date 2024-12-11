@@ -67,6 +67,7 @@ logger = logging.getLogger(__name__)
 
 MODEL_CONFIG_CLASSES = list(MODEL_FOR_CAUSAL_LM_MAPPING.keys())
 MODEL_TYPES = tuple(conf.model_type for conf in MODEL_CONFIG_CLASSES)
+USE_EXPERT_PARALLELISM = bool(os.environ.get('USE_EXPERT_PARALLELISM', 0))
 
 
 @dataclass
@@ -726,6 +727,46 @@ def main():
         data_collator=default_data_collator,
         compute_metrics=compute_metrics if training_args.do_eval and not is_torch_xla_available() else None,
     )
+
+    if USE_EXPERT_PARALLELISM:
+        assert model_args.gmm == 0, "expert parallel not support with gmm yet"
+        num_devices = xr.global_runtime_device_count()
+        expert_axis = 2
+        fsdp_axis = num_devices // expert_axis
+        mesh_shape = (fsdp_axis, expert_axis, 1)
+        # Ignore tensor axis for now. It doesn't do anything.
+        spmd_mesh = xs.Mesh(range(num_devices), mesh_shape, ('fsdp', 'expert', 'tensor'))
+        xs.set_global_mesh(spmd_mesh)
+        for name, param in model.named_parameters():
+            print('> [Expert parallel] Sharding tensor', name, param.shape)
+
+            # Here we intentionally skip layernorm and moe.gate weights given they are small.
+            if 'embed_tokens' in name:
+                xs.mark_sharding(param, spmd_mesh, ('fsdp', 'tensor'))  # needed to have activations fully sharded.
+            elif 'q_proj' in name or 'k_proj' in name or 'v_proj' in name:
+                xs.mark_sharding(param, spmd_mesh, ('tensor', 'fsdp'))
+            elif 'o_proj' in name:
+                xs.mark_sharding(param, spmd_mesh, ('fsdp', 'tensor'))
+            elif 'w1' in name or 'w3' in name or 'w2' in name:
+                xs.mark_sharding(param, spmd_mesh, ('expert', None, None))
+            elif 'lm_head' in name:
+                xs.mark_sharding(param, spmd_mesh, (('tensor', 'fsdp'), None))  # keep this fsdp.
+
+            print(f'{name} {torch_xla._XLAC._get_xla_sharding_spec(param)}')
+
+        for i, block in enumerate(model.model.layers):
+            xs.apply_backward_optimization_barrier(model.model.layers[i])
+
+        print("Applying gradient checkpointing")
+        if model.config.use_cache:
+            logger.warning_once(
+                "`use_cache=True` is incompatible with gradient checkpointing. Setting `use_cache=False`."
+            )
+            model.config.use_cache = False
+        from torch_xla.distributed.fsdp import checkpoint_module
+        for i, block in enumerate(model.model.layers):
+            model.model.layers[i] = checkpoint_module(block)
+
     # Training
     if training_args.do_train:
         checkpoint = None

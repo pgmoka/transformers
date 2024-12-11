@@ -16,8 +16,6 @@ python3 examples/pytorch/language-modeling/run_clm.py \
   --optim adafactor \
   --save_strategy no \
   --logging_strategy no \
-  --fsdp "full_shard" \
-  --fsdp_config fsdp_config.json \
   --torch_dtype bfloat16 \
   --dataloader_drop_last yes \
   --flash_attention \
