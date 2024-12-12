@@ -67,7 +67,8 @@ logger = logging.getLogger(__name__)
 
 MODEL_CONFIG_CLASSES = list(MODEL_FOR_CAUSAL_LM_MAPPING.keys())
 MODEL_TYPES = tuple(conf.model_type for conf in MODEL_CONFIG_CLASSES)
-USE_EXPERT_PARALLELISM = bool(os.environ.get('USE_EXPERT_PARALLELISM', 0))
+USE_EXPERT_PARALLELISM = (os.environ.get('USE_EXPERT_PARALLELISM', "0") == "1")
+print(f"[DEBUG] expert parallelism {USE_EXPERT_PARALLELISM}")
 
 
 @dataclass
@@ -729,7 +730,7 @@ def main():
     )
 
     if USE_EXPERT_PARALLELISM:
-        assert model_args.gmm == 0, "expert parallel not support with gmm yet"
+        assert model_args.gmm == 0, "expert parallel not supported with gmm yet"
         num_devices = xr.global_runtime_device_count()
         expert_axis = 2
         fsdp_axis = num_devices // expert_axis

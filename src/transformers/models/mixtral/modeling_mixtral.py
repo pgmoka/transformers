@@ -1221,6 +1221,17 @@ class MixtralSparseMoeBlock(nn.Module):
 
         return dispatch_mask, combine_mask
 
+    def alternate_load_balance_loss(self, top_k_indices, logits):
+        expert_mask = torch.nn.functional.one_hot(top_k_indices, num_classes=self.num_experts).to(torch.int32)
+        summed_expert_mask = torch.sum(expert_mask, dim=2)
+        # Get fraction of tokens dispatched to each expert
+        density = torch.mean(summed_expert_mask.float(), dim=1)  # Convert to float for mean
+        # get fraction of probability allocated to each expert
+        density_prob = torch.mean(logits, dim=1)
+        loss = torch.mean(density * density_prob) * (self.num_experts**2)
+        return loss
+
+
     @xp.trace_me("MixtralSparseMoeBlock")
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """ """
@@ -1247,6 +1258,7 @@ class MixtralSparseMoeBlock(nn.Module):
                 mask_axes = (('fsdp', 'expert'), None, None, None)
                 xs.mark_sharding(dispatch_mask, mesh, mask_axes)
                 xs.mark_sharding(combine_mask, mesh, mask_axes)
+                loss = self.alternate_load_balance_loss(selected_experts, expert_weights)
 
                 # TODO(bbahl): Implement loss function correctly
                 #loss = self.load_balance_loss(top_k_indices, softmax_probs)
@@ -1258,7 +1270,7 @@ class MixtralSparseMoeBlock(nn.Module):
                 expert_layer = self.experts(dispatch)
                 output = torch.einsum("ebcm,bsec -> bsm", expert_layer, combine_mask)
                 xs.mark_sharding(output, mesh, (('fsdp', 'expert'), None, None))
-                return output, router_logits
+                return output, router_logits, loss
 
             final_hidden_states = torch.zeros(
                 (batch_size * sequence_length, hidden_dim), dtype=hidden_states.dtype, device=hidden_states.device
@@ -1299,7 +1311,7 @@ class MixtralSparseMoeBlock(nn.Module):
             final_hidden_states = (final_hidden_states * routing_weights[..., None]).sum(dim=1)
 
         final_hidden_states = final_hidden_states.reshape(batch_size, sequence_length, hidden_dim)
-        return final_hidden_states, router_logits
+        return final_hidden_states, router_logits, None
 
 
 class MixtralDecoderLayer(nn.Module):
@@ -1364,7 +1376,7 @@ class MixtralDecoderLayer(nn.Module):
         # Fully Connected
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states, router_logits = self.block_sparse_moe(hidden_states)
+        hidden_states, router_logits, loss = self.block_sparse_moe(hidden_states)
         hidden_states = residual + hidden_states
 
         outputs = (hidden_states,)
@@ -1377,6 +1389,8 @@ class MixtralDecoderLayer(nn.Module):
 
         if output_router_logits:
             outputs += (router_logits,)
+
+        outputs += (loss,)
 
         return outputs
 
@@ -1541,6 +1555,7 @@ class MixtralModel(MixtralPreTrainedModel):
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         output_router_logits: Optional[bool] = None,
+        output_load_balance_loss = None,
         return_dict: Optional[bool] = None,
     ) -> Union[Tuple, MoeModelOutputWithPast]:
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
@@ -1631,6 +1646,7 @@ class MixtralModel(MixtralPreTrainedModel):
         all_router_logits = () if output_router_logits else None
         next_decoder_cache = None
 
+        total_loss = 0.0
         for decoder_layer in self.layers:
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
@@ -1667,6 +1683,10 @@ class MixtralModel(MixtralPreTrainedModel):
 
             if output_router_logits:
                 all_router_logits += (layer_outputs[-1],)
+            load_balance_loss = layer_outputs[-1]
+            total_loss += load_balance_loss
+
+        total_loss = total_loss / len(self.layers)
 
         hidden_states = self.norm(hidden_states)
 
@@ -1690,6 +1710,7 @@ class MixtralModel(MixtralPreTrainedModel):
             hidden_states=all_hidden_states,
             attentions=all_self_attns,
             router_logits=all_router_logits,
+            loss=total_loss,
         )
 
 
@@ -1808,7 +1829,7 @@ class MixtralForCausalLM(MixtralPreTrainedModel):
             shift_labels = shift_labels.view(-1)
             # Enable model parallelism
             shift_labels = shift_labels.to(shift_logits.device)
-            loss = loss_fct(shift_logits, shift_labels)
+            loss = loss_fct(shift_logits, shift_labels) + self.router_aux_loss_coef * outputs.loss
 
         aux_loss = None
         if output_router_logits:

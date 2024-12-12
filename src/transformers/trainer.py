@@ -239,7 +239,7 @@ if is_accelerate_available("0.28.0"):
     from accelerate.utils import DataLoaderConfiguration
 
 NUM_TPU_SLICE = int(os.environ.get('NUM_TPU_SLICE', 1))
-USE_EXPERT_PARALLELISM = bool(os.environ.get('USE_EXPERT_PARALLELISM', 0))
+USE_EXPERT_PARALLELISM = (os.environ.get('USE_EXPERT_PARALLELISM', "0") == "1" )
 
 def _is_peft_model(model):
     if is_peft_available():
