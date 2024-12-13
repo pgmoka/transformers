@@ -732,7 +732,7 @@ def main():
     if USE_EXPERT_PARALLELISM:
         assert model_args.gmm == 0, "expert parallel not supported with gmm yet"
         num_devices = xr.global_runtime_device_count()
-        expert_axis = 2
+        expert_axis = config.num_local_experts
         fsdp_axis = num_devices // expert_axis
         mesh_shape = (fsdp_axis, expert_axis, 1)
         # Ignore tensor axis for now. It doesn't do anything.
