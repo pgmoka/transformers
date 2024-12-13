@@ -1252,7 +1252,7 @@ class MixtralSparseMoeBlock(nn.Module):
             if self.capacity_factor > 0:
                 hidden_states = hidden_states.view(batch_size, sequence_length, hidden_dim)
                 mesh = xs.get_global_mesh()
-                selected_experts = selected_experts.view(batch_size, sequence_length, self.num_experts)
+                selected_experts = selected_experts.view(batch_size, sequence_length, self.top_k)
                 expert_weights = expert_weights.view(batch_size, sequence_length, self.num_experts)
                 dispatch_mask, combine_mask = self.generate_masks(selected_experts, expert_weights, mesh)
                 mask_axes = (('fsdp', 'expert'), None, None, None)
