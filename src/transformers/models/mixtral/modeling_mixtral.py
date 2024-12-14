@@ -848,19 +848,9 @@ class MixtralExpertParallelTop2MLP(nn.Module):
         init.kaiming_uniform_(self.w2, a=math.sqrt(5))
         init.kaiming_uniform_(self.w3, a=math.sqrt(5))
     
+    @xp.trace_me("MixtralExpertParallelTop2MLP")
     def forward(self, dispatch_input):
         mesh = xs.get_global_mesh()
-        # # Create a new node to keep the original sharding spec.
-        # zero = torch.zeros((1,), device=xm.xla_device(), dtype=self.w1.dtype)
-        # full_w1 = self.w1 + zero
-        # full_w2 = self.w2 + zero
-        # full_w3 = self.w3 + zero
-        # e,b,c,m = dispatch_input.shape
-        # # Enter manual sharding zone
-        # if mesh is not None:
-        #     w1 = xs.enable_manual_sharding(full_w1, ('expert', None, None)).global_tensor
-        #     w2 = xs.enable_manual_sharding(full_w2, ('expert', None, None)).global_tensor
-        #     w3 = xs.enable_manual_sharding(full_w3, ('expert', None, None)).global_tensor
         layer_w1 = torch.einsum("ebcm,emh->ebch", dispatch_input, self.w1)
         xs.mark_sharding(layer_w1, mesh, ('expert', 'fsdp', None, None))
         # TODO(bbahl): checkpoint intermediate tensor layer_w1
@@ -873,7 +863,6 @@ class MixtralExpertParallelTop2MLP(nn.Module):
 
         intermediate_layer = torch.einsum("ebch,ehm->ebcm", layer_multiply, self.w2)
         xs.mark_sharding(intermediate_layer, mesh, ('expert', 'fsdp', None, None))
-        # intermediate_layer = xs.disable_manual_sharding(intermediate_layer, ('fsdp', 'expert', None, 'tensor'), (e,b,c,m)).global_tensor
         # TODO(bbahl): checkpoint intermediate_layer
         return intermediate_layer
 
@@ -1182,6 +1171,7 @@ class MixtralSparseMoeBlock(nn.Module):
         self.jitter_noise = config.router_jitter_noise
         
 
+    @xp.trace_me("generate_masks")
     def generate_masks(self, top_k_indices, softmax_probs, mesh):
         # calculate expert_capacity = (tokens_per_batch / num_experts) * capacity_factor
         batch_size, seq_len, _ = top_k_indices.shape
@@ -1190,37 +1180,38 @@ class MixtralSparseMoeBlock(nn.Module):
         print(f"Applying potential token dropping with a batch expert_capacity of {expert_capacity_per_batch}")
 
         # calculate expert mask and drop tokens if needed
-        # shape of output expert mask: (batch, sequence, num_experts_per_tok)
+        # shape of output expert mask: (batch, sequence, num_experts_per_tok, num_experts)
         expert_mask = F.one_hot(top_k_indices, num_classes=self.num_experts).to(torch.int32)
-        expert_mask_fused = expert_mask.view(batch_size, seq_len * self.top_k, self.num_experts)
+        expert_mask_fused = expert_mask.view(batch_size, seq_len * self.top_k, self.num_experts) # (batch, s * top_k, e)
         xs.mark_sharding(expert_mask_fused, mesh, (('fsdp', 'expert'), None, None))
         
-        expert_token_count_fused = torch.cumsum(expert_mask_fused, dim=1)
-        expert_token_count = expert_token_count_fused.view(batch_size, seq_len, self.top_k, self.num_experts)
+        expert_token_count_fused = torch.cumsum(expert_mask_fused, dim=1) # (b, s * top_k , e)
+        expert_token_count = expert_token_count_fused.view(batch_size, seq_len, self.top_k, self.num_experts) # (b, s, k, e)
         xs.mark_sharding(expert_token_count, mesh, (('fsdp', 'expert'), None, None, None))
         
-        trunc_expert_mask = expert_mask * (expert_token_count <= expert_capacity_per_batch).to(torch.int32)
-        combined_expert_mask = trunc_expert_mask.sum(dim=2)
+        trunc_expert_mask = expert_mask * (expert_token_count <= expert_capacity_per_batch).to(torch.int32) # (b, s, k, e)
+        combined_expert_mask = trunc_expert_mask.sum(dim=2) # (b, s, e)
         
         # reshape & update weights
-        softmax_probs = softmax_probs*combined_expert_mask
+        softmax_probs = softmax_probs*combined_expert_mask # (b, s, e)
 
         # calculate token position in expert capacity dimension
-        expert_token_position_fused = expert_mask_fused * expert_token_count_fused
-        expert_token_position = expert_token_position_fused.view(batch_size, seq_len, self.top_k, self.num_experts)
-        combined_expert_token_position = expert_token_position.sum(dim=2) * combined_expert_mask
+        expert_token_position_fused = expert_mask_fused * expert_token_count_fused # (b, s, k, e)
+        expert_token_position = expert_token_position_fused.view(batch_size, seq_len, self.top_k, self.num_experts) # (b, s, k, e)
+        combined_expert_token_position = expert_token_position.sum(dim=2) * combined_expert_mask # (b, s, e)
         
         expert_token_position_in_capacity = F.one_hot(
-            combined_expert_token_position, num_classes=expert_capacity_per_batch + 1).to(torch.int32)
+            combined_expert_token_position, num_classes=expert_capacity_per_batch + 1).to(torch.int32) # (b, s, e, c)
 
         # shape of combine_mask is (batch_size, seq_len, num_experts, expert_capacity_per_batch + 1),
         # and cut 0-dimension which is always 0
         combine_mask = softmax_probs.unsqueeze(-1) * expert_token_position_in_capacity
         combine_mask = combine_mask[..., 1:]
-        dispatch_mask = combine_mask.bool()
+        dispatch_mask = combine_mask.bool() # (b, s, e, c)
 
         return dispatch_mask, combine_mask
 
+    @xp.trace_me("load_balance_loss_func")
     def alternate_load_balance_loss(self, top_k_indices, logits):
         expert_mask = torch.nn.functional.one_hot(top_k_indices, num_classes=self.num_experts).to(torch.int32)
         summed_expert_mask = torch.sum(expert_mask, dim=2)
@@ -1260,15 +1251,14 @@ class MixtralSparseMoeBlock(nn.Module):
                 xs.mark_sharding(combine_mask, mesh, mask_axes)
                 loss = self.alternate_load_balance_loss(selected_experts, expert_weights)
 
-                # TODO(bbahl): Implement loss function correctly
-                #loss = self.load_balance_loss(top_k_indices, softmax_probs)
-
                 xs.mark_sharding(hidden_states, mesh, (('fsdp', 'expert'), None, None))
-                dispatch = torch.einsum("bsm,bsec->ebcm", hidden_states, dispatch_mask)
+                with xp.Trace("bsm,bsec->ebcm"):
+                    dispatch = torch.einsum("bsm,bsec->ebcm", hidden_states, dispatch_mask)
                 xs.mark_sharding(dispatch, mesh, ('expert', 'fsdp', None, None))
 
                 expert_layer = self.experts(dispatch)
-                output = torch.einsum("ebcm,bsec -> bsm", expert_layer, combine_mask)
+                with xp.Trace("ebcm,bsec -> bsm"):
+                    output = torch.einsum("ebcm,bsec -> bsm", expert_layer, combine_mask)
                 xs.mark_sharding(output, mesh, (('fsdp', 'expert'), None, None))
                 return output, router_logits, loss
 
