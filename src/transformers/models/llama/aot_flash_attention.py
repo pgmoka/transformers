@@ -197,6 +197,11 @@ def make_kernel_from_pallas(kernel: Callable, output_shape_dtype_fn: Callable):
   return functools.partial(wrapped_kernel, kernel, output_shape_dtype_fn)
 
 
+# Note: the alias inference and mutation removal in PyTorch doesn't work. So we
+# 
+# - Explicitly clone all inputs.
+# - Clone outputs if the output aliases an input.
+#
 @custom_op("xla::fa_custom_forward", mutates_args=())
 def fa_custom_forward(
     q: torch.Tensor, k: torch.Tensor, v: torch.Tensor
@@ -334,13 +339,12 @@ def fa_custom_forward(
 
   assert partition_spec is not None
 
-  # TODO: this causes !IsManual() assertion
-  # xs.mark_sharding(full_q, mesh, partition_spec)
-  # xs.mark_sharding(full_k, mesh, partition_spec)
-  # xs.mark_sharding(full_v, mesh, partition_spec)
-  # xs.mark_sharding(o, mesh, partition_spec)
-  # xs.mark_sharding(l, mesh, partition_spec[:3])
-  # xs.mark_sharding(m, mesh, partition_spec[:3])
+  xs.mark_sharding(full_q, mesh, partition_spec)
+  xs.mark_sharding(full_k, mesh, partition_spec)
+  xs.mark_sharding(full_v, mesh, partition_spec)
+  xs.mark_sharding(o, mesh, partition_spec)
+  xs.mark_sharding(l, mesh, partition_spec[:3])
+  xs.mark_sharding(m, mesh, partition_spec[:3])
 
   # q_segment_ids and kv_segment_ids are sharded here if partition_spec is provided
   # but it should be OK as the backward will use the same partition_spec
@@ -390,21 +394,21 @@ def fa_custom_backward(
   mesh = xs.get_global_mesh()
   assert mesh is not None
 
-  # TODO: this causes !IsManual() assertion
-  # xs.mark_sharding(q, mesh, partition_spec)
-  # xs.mark_sharding(k, mesh, partition_spec)
-  # xs.mark_sharding(v, mesh, partition_spec)
-  # xs.mark_sharding(o, mesh, partition_spec)
-  # xs.mark_sharding(l, mesh, partition_spec[:3])
-  # xs.mark_sharding(m, mesh, partition_spec[:3])
-
   if _DEBUG:
     print("Inside fa_custom_backward")
 
   from jax.experimental.pallas.ops.tpu.flash_attention import _flash_attention_bwd_dq, _flash_attention_bwd_dkv
 
   saved_tensors = (q, k, v, o, l, m)
-  q, k, v, o, l, m = (t for t in saved_tensors)
+  q, k, v, o, l, m = (t.clone() for t in saved_tensors)
+
+  xs.mark_sharding(q, mesh, partition_spec)
+  xs.mark_sharding(k, mesh, partition_spec)
+  xs.mark_sharding(v, mesh, partition_spec)
+  xs.mark_sharding(o, mesh, partition_spec)
+  xs.mark_sharding(l, mesh, partition_spec[:3])
+  xs.mark_sharding(m, mesh, partition_spec[:3])
+
   causal = True
   sm_scale = 1.0
   q_full_shape = torch.Size(q_shape)

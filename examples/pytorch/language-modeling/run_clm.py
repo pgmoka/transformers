@@ -572,8 +572,8 @@ def main():
             model.config.use_cache = False
             
         # Activate scan
-        # model.model.unroll_decoders = False
-        model.model.unroll_decoders = True
+        model.model.unroll_decoders = False
+        # model.model.unroll_decoders = True
 
         # Materialize all weights after 2d sharding
         torch_xla.sync()
