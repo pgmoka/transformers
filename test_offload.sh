@@ -14,12 +14,19 @@ mkdir -p xla_dumps/scan-offload-ptxla
 
 export XLA_IR_DEBUG=1
 export XLA_HLO_DEBUG=1
+export PROFILE_EPOCH=0
+export PROFILE_STEP=4
+export PROFILE_DURATION_MS=120000
+export PROFILE_LOGDIR=/workspaces/torch/profile/scan-offload-ptxla
+
+mkdir -p /workspaces/torch/profile/scan-offload-ptxla
 
 export XLA_SAVE_TENSORS_FILE=ir_dumps/scan-offload-ptxla.txt
 export XLA_SAVE_TENSORS_FMT=hlo
 export XLA_FLAGS=--xla_dump_to=xla_dumps/scan-offload-ptxla
 
-BLOCK_SIZE=4096
+# BLOCK_SIZE=4096
+BLOCK_SIZE=2048
 EXTRA='--flash_attention'
 
 # Debugging notes:

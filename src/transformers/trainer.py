@@ -36,6 +36,9 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple, Union
 
+import torch_xla
+import torch_xla.debug.profiler as xp
+
 
 # Integrations must be imported before ML frameworks:
 # isort: off
@@ -3593,7 +3596,8 @@ class Trainer:
             with amp.scale_loss(loss, self.optimizer) as scaled_loss:
                 scaled_loss.backward()
         else:
-            self.accelerator.backward(loss, **kwargs)
+            with xp.Trace('backward'):
+                self.accelerator.backward(loss, **kwargs)
 
         return loss.detach() / self.args.gradient_accumulation_steps
 

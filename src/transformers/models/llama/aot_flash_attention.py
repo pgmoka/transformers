@@ -16,10 +16,23 @@ from typing import Any, List, Callable, Optional, Tuple, Dict
 from torch.library import impl, custom_op
 from torch_xla.core.xla_model import XLA_LIB
 from torch_xla.experimental.custom_kernel import FlashAttention
+import torch_xla.debug.profiler as xp
 
 _XLA_USE_BF16 = os.environ.get("XLA_USE_BF16", "0") == "1"
 
 _DEBUG = False
+
+
+def defeat_device_data(v):
+  """
+  mark_sharding incorrectly assumes that device data tensors are always input data
+  to be transferred to the TPU.
+
+  Use this function to stop a tensor from become device data, so that sharding
+  annotations may be applied.
+  """
+  epsilon = 1e-9
+  return v + epsilon
 
 
 def describe_value(v):
@@ -198,7 +211,7 @@ def make_kernel_from_pallas(kernel: Callable, output_shape_dtype_fn: Callable):
 
 
 # Note: the alias inference and mutation removal in PyTorch doesn't work. So we
-# 
+#
 # - Explicitly clone all inputs.
 # - Clone outputs if the output aliases an input.
 #
@@ -207,9 +220,10 @@ def fa_custom_forward(
     q: torch.Tensor, k: torch.Tensor, v: torch.Tensor
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor,
            torch.Tensor]:
-  q = q.clone()
-  k = k.clone()
-  v = v.clone()
+  with xp.Trace('prologue'):
+    q = defeat_device_data(q)
+    k = defeat_device_data(k)
+    v = defeat_device_data(v)
 
   partition_spec = ('fsdp', 'tensor', None, None)
   mesh = xs.get_global_mesh()
@@ -252,19 +266,20 @@ def fa_custom_forward(
   # prevent storage sharing and then delete the alias annotation. Otherwise,
   # please file an issue on GitHub.
   #
-  full_q = q.clone()
-  full_k = k.clone()
-  full_v = v.clone()
-  full_ab = ab
-  if partition_spec is not None:
-    q_full_shape = q.shape
-    kv_full_shape = k.shape
-    q = xs.enable_manual_sharding(q, partition_spec, mesh=mesh).global_tensor
-    k = xs.enable_manual_sharding(k, partition_spec, mesh=mesh).global_tensor
-    v = xs.enable_manual_sharding(v, partition_spec, mesh=mesh).global_tensor
-    if ab:
-      ab = xs.enable_manual_sharding(
-          ab, partition_spec, mesh=mesh).global_tensor
+  with xp.Trace('shard'):
+    full_q = q.clone()
+    full_k = k.clone()
+    full_v = v.clone()
+    full_ab = ab
+    if partition_spec is not None:
+      q_full_shape = q.shape
+      kv_full_shape = k.shape
+      q = xs.enable_manual_sharding(q, partition_spec, mesh=mesh).global_tensor
+      k = xs.enable_manual_sharding(k, partition_spec, mesh=mesh).global_tensor
+      v = xs.enable_manual_sharding(v, partition_spec, mesh=mesh).global_tensor
+      if ab:
+        ab = xs.enable_manual_sharding(
+            ab, partition_spec, mesh=mesh).global_tensor
 
   # It computes the shape and type of o, l, m.
   shapes = [q.shape]
@@ -288,35 +303,37 @@ def fa_custom_forward(
     segment_ids, q_segment_ids_fa, kv_segment_ids_fa = FlashAttention.prepare_segment_ids(
         q_segment_ids, kv_segment_ids)
 
-    # We can't directly use flash_attention as we need to override the save_residuals flag which returns
-    # l and m that is needed for the backward. Then we lose all the shape checks.
-    # TODO: replicate the shape checks on flash_attention.
-    # Here we seperate the tracing and execution part just to support SegmentIds.
-    payload, _ = trace_pallas(
-        _flash_attention_impl,
-        q,
-        k,
-        v,
-        ab,
-        segment_ids,
-        save_residuals,
-        causal,
-        sm_scale,
-        min(FlashAttention.DEFAULT_BLOCK_SIZES["block_b"], q.shape[0]),
-        min(FlashAttention.DEFAULT_BLOCK_SIZES["block_q"], q.shape[2]),
-        min(FlashAttention.DEFAULT_BLOCK_SIZES["block_k_major"], k.shape[2]),
-        min(FlashAttention.DEFAULT_BLOCK_SIZES["block_k"], k.shape[2]),
-        False,
-        static_argnums=range(5, 13),
-        use_cache=True,
-    )
+    with xp.Trace('pallas'):
+      # We can't directly use flash_attention as we need to override the save_residuals flag which returns
+      # l and m that is needed for the backward. Then we lose all the shape checks.
+      # TODO: replicate the shape checks on flash_attention.
+      # Here we seperate the tracing and execution part just to support SegmentIds.
+      payload, _ = trace_pallas(
+          _flash_attention_impl,
+          q,
+          k,
+          v,
+          ab,
+          segment_ids,
+          save_residuals,
+          causal,
+          sm_scale,
+          min(FlashAttention.DEFAULT_BLOCK_SIZES["block_b"], q.shape[0]),
+          min(FlashAttention.DEFAULT_BLOCK_SIZES["block_q"], q.shape[2]),
+          min(FlashAttention.DEFAULT_BLOCK_SIZES["block_k_major"], k.shape[2]),
+          min(FlashAttention.DEFAULT_BLOCK_SIZES["block_k"], k.shape[2]),
+          False,
+          static_argnums=range(5, 13),
+          use_cache=True,
+      )
 
-    args = [q, k, v]
-    if ab is not None:
-      args += [ab]
-    if segment_ids is not None:
-      args += [q_segment_ids_fa, kv_segment_ids_fa]
-    o = torch_xla._XLAC._xla_tpu_custom_call(args, payload, shapes, dtypes)
+    with xp.Trace('custom_call'):
+      args = [q, k, v]
+      if ab is not None:
+        args += [ab]
+      if segment_ids is not None:
+        args += [q_segment_ids_fa, kv_segment_ids_fa]
+      o = torch_xla._XLAC._xla_tpu_custom_call(args, payload, shapes, dtypes)
 
     if not save_residuals:
       o = o[0]
@@ -325,26 +342,38 @@ def fa_custom_forward(
         o = xs.disable_manual_sharding(
             o, partition_spec, q_full_shape, mesh=mesh).global_tensor
       return o
-    o, *aux = o
-    l, m = (v[..., 0] for v in aux[-2:])
+
+    assert isinstance(o, list)
+    with xp.Trace('destructure1'):
+      o, *aux = o
+    with xp.Trace('destructure2'):
+      # l, m = (v[..., 0] for v in aux[-2:])
+      # print("Reading l. Aux is:")
+      # print(torch_xla._XLAC._get_xla_tensors_text([aux[-2]]))
+      # print("l is:")
+
+      # The fancier slice notation lowers to `aten.take`, which sends a large indexing
+      # tensor to the device and confuses the XLA compiler when used under scan for some reason.
+      # See the transfer to device in a trace: http://shortn/_4zOQhGezCS.
+      # As a result, we get a `!IsManual()` assertion in HLO sharding propgation.
+      # Therefore, we spell it as a permute + index into the first dim.
+      # l = aux[-2][:, :, :, 0]
+      l = aux[-2].permute(3, 0, 1, 2)[0]
+      # print(torch_xla._XLAC._get_xla_tensors_text([l]))
+      # m = aux[-1][:, :, :, 0]
+      m = aux[-1].permute(3, 0, 1, 2)[0]
 
   # SPMD integration
-  if partition_spec is not None:
-    o = xs.disable_manual_sharding(
-        o, partition_spec, q_full_shape, mesh=mesh).global_tensor
-    l = xs.disable_manual_sharding(
-        l, partition_spec[0:3], q_full_shape[0:3], mesh=mesh).global_tensor
-    m = xs.disable_manual_sharding(
-        m, partition_spec[0:3], q_full_shape[0:3], mesh=mesh).global_tensor
+  with xp.Trace('shard2'):
+    if partition_spec is not None:
+      o = xs.disable_manual_sharding(
+          o, partition_spec, q_full_shape, mesh=mesh).global_tensor
+      l = xs.disable_manual_sharding(
+          l, partition_spec[0:3], q_full_shape[0:3], mesh=mesh).global_tensor
+      m = xs.disable_manual_sharding(
+          m, partition_spec[0:3], q_full_shape[0:3], mesh=mesh).global_tensor
 
   assert partition_spec is not None
-
-  xs.mark_sharding(full_q, mesh, partition_spec)
-  xs.mark_sharding(full_k, mesh, partition_spec)
-  xs.mark_sharding(full_v, mesh, partition_spec)
-  xs.mark_sharding(o, mesh, partition_spec)
-  xs.mark_sharding(l, mesh, partition_spec[:3])
-  xs.mark_sharding(m, mesh, partition_spec[:3])
 
   # q_segment_ids and kv_segment_ids are sharded here if partition_spec is provided
   # but it should be OK as the backward will use the same partition_spec
@@ -399,15 +428,9 @@ def fa_custom_backward(
 
   from jax.experimental.pallas.ops.tpu.flash_attention import _flash_attention_bwd_dq, _flash_attention_bwd_dkv
 
+  grad_output = defeat_device_data(grad_output)
   saved_tensors = (q, k, v, o, l, m)
-  q, k, v, o, l, m = (t.clone() for t in saved_tensors)
-
-  xs.mark_sharding(q, mesh, partition_spec)
-  xs.mark_sharding(k, mesh, partition_spec)
-  xs.mark_sharding(v, mesh, partition_spec)
-  xs.mark_sharding(o, mesh, partition_spec)
-  xs.mark_sharding(l, mesh, partition_spec[:3])
-  xs.mark_sharding(m, mesh, partition_spec[:3])
+  q, k, v, o, l, m = (defeat_device_data(t) for t in saved_tensors)
 
   causal = True
   sm_scale = 1.0

@@ -19,6 +19,7 @@
 # limitations under the License.
 import math
 from typing import List, Optional, Tuple, Union
+from functools import partial
 
 import torch
 import torch.nn.functional as F
@@ -26,6 +27,9 @@ import torch.utils.checkpoint
 from torch import nn
 from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
 from functorch.compile import min_cut_rematerialization_partition
+
+from .graph_transforms.offloading import offload_name, remat_all_and_offload_these_inputs
+from .graph_transforms.remat_all import remat_all_partition_fn
 
 from ...activations import ACT2FN
 from ...cache_utils import Cache, DynamicCache, StaticCache
@@ -85,7 +89,7 @@ class LlamaRMSNorm(nn.Module):
         hidden_states = hidden_states.to(torch.float32)
         variance = hidden_states.pow(2).mean(-1, keepdim=True)
         hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
-        return (self.weight * hidden_states.to(input_dtype)).bfloat16()
+        return self.weight * hidden_states.to(input_dtype)
 
     def extra_repr(self):
         return f"{tuple(self.weight.shape)}, eps={self.variance_epsilon}"
@@ -694,9 +698,9 @@ class LlamaDecoderLayer(nn.Module):
                 Arbitrary kwargs to be ignored, used for FSDP and other methods that injects code
                 into the model
         """
-        residual = hidden_states.bfloat16()
+        residual = hidden_states
 
-        hidden_states = self.input_layernorm(hidden_states).bfloat16()
+        hidden_states = self.input_layernorm(hidden_states)
 
         # Self Attention
         hidden_states, self_attn_weights, present_key_value = self.self_attn(
@@ -710,13 +714,12 @@ class LlamaDecoderLayer(nn.Module):
             position_embeddings=position_embeddings,
             **kwargs,
         )
-        hidden_states = hidden_states.bfloat16()
         hidden_states = residual + hidden_states
 
         # Fully Connected
         residual = hidden_states
-        hidden_states = self.post_attention_layernorm(hidden_states).bfloat16()
-        hidden_states = self.mlp(hidden_states).bfloat16()
+        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
 
         outputs = (hidden_states,)
@@ -775,6 +778,9 @@ class LlamaPreTrainedModel(PreTrainedModel):
             module.weight.data.normal_(mean=0.0, std=std)
             if module.padding_idx is not None:
                 module.weight.data[module.padding_idx].zero_()
+
+remat_all_offload_decoder_input = partial(
+    remat_all_and_offload_these_inputs, names_to_offload=["decoder_input"])
 
 
 LLAMA_INPUTS_DOCSTRING = r"""
@@ -983,6 +989,7 @@ class LlamaModel(LlamaPreTrainedModel):
                     self.causal_mask = nn.Buffer(causal_mask)
 
                 def forward(self, hidden_states):
+                    hidden_states = offload_name(hidden_states, "decoder_input")
                     layer_outputs = self.decoder_layer(
                         hidden_states,
                         attention_mask=self.causal_mask,
@@ -997,7 +1004,7 @@ class LlamaModel(LlamaPreTrainedModel):
                     return hidden_states
 
             curried_layers = [ CurriedLayer(l, position_embeddings, causal_mask) for l in self.layers ]
-            hidden_states = scan_layers(curried_layers, hidden_states, partition_fn=min_cut_rematerialization_partition)
+            hidden_states = scan_layers(curried_layers, hidden_states, partition_fn=remat_all_partition_fn)
         else:
             self.log_once("NOTE: Using for loop to run decoder layers")
 
