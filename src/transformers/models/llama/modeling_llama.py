@@ -1004,7 +1004,7 @@ class LlamaModel(LlamaPreTrainedModel):
                     return hidden_states
 
             curried_layers = [ CurriedLayer(l, position_embeddings, causal_mask) for l in self.layers ]
-            hidden_states = scan_layers(curried_layers, hidden_states, partition_fn=remat_all_partition_fn)
+            hidden_states = scan_layers(curried_layers, hidden_states, partition_fn=remat_all_offload_decoder_input)
         else:
             self.log_once("NOTE: Using for loop to run decoder layers")
 
