@@ -3584,6 +3584,9 @@ class Trainer:
                 torch.cuda.empty_cache()
 
         kwargs = {}
+        
+        # Set a debug env var to find unexpected transfers to device.
+        os.environ["DEBUG_TRANSFER_IR_VALUE_TENSOR_TO_XLA_DATA"] = "1"
 
         # For LOMO optimizers you need to explicitly use the learnign rate
         if self.args.optim in [OptimizerNames.LOMO, OptimizerNames.ADALOMO]:
@@ -3598,6 +3601,8 @@ class Trainer:
         else:
             with xp.Trace('backward'):
                 self.accelerator.backward(loss, **kwargs)
+                
+        del os.environ["DEBUG_TRANSFER_IR_VALUE_TENSOR_TO_XLA_DATA"]
 
         return loss.detach() / self.args.gradient_accumulation_steps
 
