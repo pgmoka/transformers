@@ -25,6 +25,7 @@ import torch.nn.functional as F
 import torch.utils.checkpoint
 from torch import nn
 from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
+from functorch.compile import min_cut_rematerialization_partition
 
 from ...activations import ACT2FN
 from ...cache_utils import Cache, DynamicCache, StaticCache
@@ -80,10 +81,11 @@ class LlamaRMSNorm(nn.Module):
 
     def forward(self, hidden_states):
         input_dtype = hidden_states.dtype
+        assert input_dtype == torch.bfloat16
         hidden_states = hidden_states.to(torch.float32)
         variance = hidden_states.pow(2).mean(-1, keepdim=True)
         hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
-        return self.weight * hidden_states.to(input_dtype)
+        return (self.weight * hidden_states.to(input_dtype)).bfloat16()
 
     def extra_repr(self):
         return f"{tuple(self.weight.shape)}, eps={self.variance_epsilon}"
@@ -392,9 +394,10 @@ class LlamaAttention(nn.Module):
             attn_output = torch.matmul(attn_weights, value_states)
         else:
             # Integrated with PyTorch/XLA Pallas Flash Attention:
-            from torch_xla.experimental.custom_kernel import flash_attention
+            from .aot_flash_attention import flash_attention_2
             query_states /= math.sqrt(self.head_dim)
-            attn_output = flash_attention(query_states, key_states, value_states, causal=True, partition_spec=('fsdp', 'tensor', None, None))
+            attn_output = flash_attention_2(query_states, key_states, value_states, causal=True, partition_spec=('fsdp', 'tensor', None, None))
+            assert attn_output.dtype == torch.bfloat16
 
         if attn_output.size() != (bsz, self.num_heads, q_len, self.head_dim):
             raise ValueError(
@@ -691,9 +694,9 @@ class LlamaDecoderLayer(nn.Module):
                 Arbitrary kwargs to be ignored, used for FSDP and other methods that injects code
                 into the model
         """
-        residual = hidden_states
+        residual = hidden_states.bfloat16()
 
-        hidden_states = self.input_layernorm(hidden_states)
+        hidden_states = self.input_layernorm(hidden_states).bfloat16()
 
         # Self Attention
         hidden_states, self_attn_weights, present_key_value = self.self_attn(
@@ -707,19 +710,22 @@ class LlamaDecoderLayer(nn.Module):
             position_embeddings=position_embeddings,
             **kwargs,
         )
+        hidden_states = hidden_states.bfloat16()
         hidden_states = residual + hidden_states
 
         # Fully Connected
         residual = hidden_states
-        hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = self.mlp(hidden_states)
+        hidden_states = self.post_attention_layernorm(hidden_states).bfloat16()
+        hidden_states = self.mlp(hidden_states).bfloat16()
         hidden_states = residual + hidden_states
 
         outputs = (hidden_states,)
 
+        assert not output_attentions
         if output_attentions:
             outputs += (self_attn_weights,)
 
+        assert not use_cache 
         if use_cache:
             outputs += (present_key_value,)
 
@@ -870,6 +876,7 @@ class LlamaModel(LlamaPreTrainedModel):
         self.norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = LlamaRotaryEmbedding(config=config)
         self.gradient_checkpointing = False
+        self.unroll_decoders = config.unroll_decoders
 
         # Initialize weights and apply final processing
         self.post_init()
@@ -881,6 +888,13 @@ class LlamaModel(LlamaPreTrainedModel):
 
     def set_input_embeddings(self, value):
         self.embed_tokens = value
+        
+    def log_once(self, message):
+        if not hasattr(self, "logged_messages"):
+            self.logged_messages = set()
+        if message not in self.logged_messages:
+            print(message)
+            self.logged_messages.add(message)
 
     @xp.trace_me("LlamaModel")
     @add_start_docstrings_to_model_forward(LLAMA_INPUTS_DOCSTRING)
@@ -951,41 +965,77 @@ class LlamaModel(LlamaPreTrainedModel):
         all_self_attns = () if output_attentions else None
         next_decoder_cache = None
 
-        for decoder_layer in self.layers:
-            if output_hidden_states:
-                all_hidden_states += (hidden_states,)
+        # Condition for `scan_layers`
+        if not self.unroll_decoders and not use_cache and \
+            not output_attentions and not output_hidden_states:
+            self.log_once("NOTE: Using scan_layers to speed up compilation")
 
-            if self.gradient_checkpointing and self.training:
-                layer_outputs = self._gradient_checkpointing_func(
-                    decoder_layer.__call__,
-                    hidden_states,
-                    causal_mask,
-                    position_ids,
-                    past_key_values,
-                    output_attentions,
-                    use_cache,
-                    cache_position,
-                    position_embeddings,
-                )
-            else:
-                layer_outputs = decoder_layer(
-                    hidden_states,
-                    attention_mask=causal_mask,
-                    position_ids=position_ids,
-                    past_key_value=past_key_values,
-                    output_attentions=output_attentions,
-                    use_cache=use_cache,
-                    cache_position=cache_position,
-                    position_embeddings=position_embeddings,
-                )
+            from torch_xla.experimental.scan_layers import scan_layers
 
-            hidden_states = layer_outputs[0]
+            # We thread `position_embeddings` and `causal_mask` through the layers because
+            # AOTAutograd can't trace free variable accesses.
+            class CurriedLayer(torch.nn.Module):
+                def __init__(self, decoder_layer, position_embeddings, causal_mask):
+                    super().__init__()
+                    self.decoder_layer = decoder_layer
+                    self.position_embeddings_0 = nn.Buffer(position_embeddings[0])
+                    self.position_embeddings_1 = nn.Buffer(position_embeddings[1])
+                    self.causal_mask = nn.Buffer(causal_mask)
 
-            if use_cache:
-                next_decoder_cache = layer_outputs[2 if output_attentions else 1]
+                def forward(self, hidden_states):
+                    layer_outputs = self.decoder_layer(
+                        hidden_states,
+                        attention_mask=self.causal_mask,
+                        position_ids=position_ids,
+                        past_key_value=past_key_values,
+                        output_attentions=output_attentions,
+                        use_cache=use_cache,
+                        cache_position=cache_position,
+                        position_embeddings=(self.position_embeddings_0, self.position_embeddings_1),
+                    )
+                    hidden_states = layer_outputs[0]
+                    return hidden_states
 
-            if output_attentions:
-                all_self_attns += (layer_outputs[1],)
+            curried_layers = [ CurriedLayer(l, position_embeddings, causal_mask) for l in self.layers ]
+            hidden_states = scan_layers(curried_layers, hidden_states, partition_fn=min_cut_rematerialization_partition)
+        else:
+            self.log_once("NOTE: Using for loop to run decoder layers")
+
+            for decoder_layer in self.layers:
+                if output_hidden_states:
+                    all_hidden_states += (hidden_states,)
+
+                if self.gradient_checkpointing and self.training:
+                    layer_outputs = self._gradient_checkpointing_func(
+                        decoder_layer.__call__,
+                        hidden_states,
+                        causal_mask,
+                        position_ids,
+                        past_key_values,
+                        output_attentions,
+                        use_cache,
+                        cache_position,
+                        position_embeddings,
+                    )
+                else:
+                    layer_outputs = decoder_layer(
+                        hidden_states,
+                        attention_mask=causal_mask,
+                        position_ids=position_ids,
+                        past_key_value=past_key_values,
+                        output_attentions=output_attentions,
+                        use_cache=use_cache,
+                        cache_position=cache_position,
+                        position_embeddings=position_embeddings,
+                    )
+
+                hidden_states = layer_outputs[0]
+
+                if use_cache:
+                    next_decoder_cache = layer_outputs[2 if output_attentions else 1]
+
+                if output_attentions:
+                    all_self_attns += (layer_outputs[1],)
 
         hidden_states = self.norm(hidden_states)
 

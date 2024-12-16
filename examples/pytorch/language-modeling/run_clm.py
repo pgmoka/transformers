@@ -64,6 +64,7 @@ require_version("datasets>=2.14.0", "To fix: pip install -r examples/pytorch/lan
 
 logger = logging.getLogger(__name__)
 
+torch.set_default_dtype(torch.bfloat16)
 
 MODEL_CONFIG_CLASSES = list(MODEL_FOR_CAUSAL_LM_MAPPING.keys())
 MODEL_TYPES = tuple(conf.model_type for conf in MODEL_CONFIG_CLASSES)
@@ -454,6 +455,7 @@ def main():
             if model_args.torch_dtype in ["auto", None]
             else getattr(torch, model_args.torch_dtype)
         )
+        assert torch_dtype == "bfloat16"
         model = AutoModelForCausalLM.from_pretrained(
             model_args.model_name_or_path,
             from_tf=bool(".ckpt" in model_args.model_name_or_path),
@@ -536,7 +538,7 @@ def main():
         dict_of_params = {}
         for name, param in chain(model.named_parameters(), model.named_buffers()):
             # Before `rand`, param is meta tensor. We initialize it explicitly and send to XLA.
-            param = torch.rand(param.shape, dtype=param.dtype, device='cpu').to(device)
+            param = torch.rand(param.shape, dtype=param.dtype, device=device)
 
             print('> [2D] Sharding tensor', name, param.shape)
 
@@ -562,22 +564,18 @@ def main():
         model.to('xla')
         for i, block in enumerate(model.model.layers):
             xs.apply_backward_optimization_barrier(model.model.layers[i])
+            
+        if model.config.use_cache:
+            logger.warning_once(
+                "`use_cache=True` is incompatible with gradient checkpointing. Setting `use_cache=False`."
+            )
+            model.config.use_cache = False
+            
+        # Activate scan
+        # model.model.unroll_decoders = False
+        model.model.unroll_decoders = True
 
-        if model_args.remat_every > 0:
-            print(f"Applying gradient checkpointing to every {model_args.remat_every} layer")
-            if model.config.use_cache:
-                logger.warning_once(
-                    "`use_cache=True` is incompatible with gradient checkpointing. Setting `use_cache=False`."
-                )
-                model.config.use_cache = False
-            from torch_xla.distributed.fsdp import checkpoint_module
-            for i, block in enumerate(model.model.layers):
-                if i % model_args.remat_every == 0:
-                    model.model.layers[i] = checkpoint_module(block)
-        else:
-            print("Not applying gradient checkpointing")
-
-        # materialize all weights after 2d sharding
+        # Materialize all weights after 2d sharding
         torch_xla.sync()
 
     import torch_xla.debug.metrics as met
