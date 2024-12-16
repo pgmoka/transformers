@@ -1,4 +1,14 @@
-set -exo
+################################################################
+#
+# This script tests the following configuration:
+# - Llama 3-8B
+# - Use scan to execute decoder layers
+# - Checkpoint each decoder layer
+# - Offload decoder inputs to host memory
+# - 2D (FSDP, tensor parallel) sharding
+# - Flash attention pallas kernel
+
+set -ex
 
 export LIBTPU_INIT_ARGS="--xla_enable_async_all_gather=true --xla_tpu_enable_async_collective_fusion=true --xla_tpu_enable_async_collective_fusion_fuse_all_gather=true --xla_tpu_enable_async_collective_fusion_multiple_steps=true --xla_tpu_decompose_all_gather_einsum=true --xla_tpu_decompose_einsum_reduce_scatter=true --xla_tpu_scoped_vmem_limit_kib=98304 --xla_tpu_spmd_rng_bit_generator_unsafe=true --xla_tpu_overlap_compute_collective_tc=true --xla_tpu_use_enhanced_launch_barrier=true --xla_tpu_enable_all_experimental_scheduler_features=true --xla_tpu_enable_scheduler_memory_pressure_tracking=true --xla_tpu_host_transfer_overlap_limit=2 --xla_tpu_aggressive_opt_barrier_removal=ENABLED --xla_lhs_prioritize_async_depth_over_stall=ENABLED --xla_tpu_enable_ag_backward_pipelining=true --xla_should_allow_loop_variant_parameter_in_chain=ENABLED --xla_should_add_loop_invariant_op_in_chain=ENABLED --xla_max_concurrent_host_send_recv=100 --xla_tpu_scheduler_percent_shared_memory_limit=100 --xla_latency_hiding_scheduler_rerun=2"
 
@@ -25,9 +35,38 @@ export XLA_SAVE_TENSORS_FILE=ir_dumps/scan-offload-ptxla.txt
 export XLA_SAVE_TENSORS_FMT=hlo
 export XLA_FLAGS=--xla_dump_to=xla_dumps/scan-offload-ptxla
 
-# BLOCK_SIZE=4096
-BLOCK_SIZE=2048
+BLOCK_SIZE=4096
 EXTRA='--flash_attention'
+
+cat << EOF > /workspaces/torch/model_config.json
+{
+    "architectures": [
+      "LlamaForCausalLM"
+    ],
+    "attention_bias": false,
+    "attention_dropout": 0.0,
+    "bos_token_id": 128000,
+    "eos_token_id": 128001,
+    "hidden_act": "silu",
+    "hidden_size": 4096,
+    "initializer_range": 0.02,
+    "intermediate_size": 14336,
+    "max_position_embeddings": 8192,
+    "model_type": "llama",
+    "num_attention_heads": 32,
+    "num_hidden_layers": 32,
+    "num_key_value_heads": 8,
+    "pretraining_tp": 1,
+    "rms_norm_eps": 1e-05,
+    "rope_scaling": null,
+    "rope_theta": 500000.0,
+    "tie_word_embeddings": false,
+    "torch_dtype": "bfloat16",
+    "transformers_version": "4.40.0.dev0",
+    "use_cache": false,
+    "vocab_size": 128256
+}
+EOF
 
 # Debugging notes:
 # set print object on
@@ -44,7 +83,7 @@ python3 examples/pytorch/language-modeling/run_clm.py \
   --overwrite_output_dir \
   --config_name /workspaces/torch/config.json \
   --cache_dir /workspaces/torch/cache \
-  --tokenizer_name meta-llama/Llama-2-7b-hf \
+  --tokenizer_name meta-llama/Meta-Llama-3-8B \
   --block_size $BLOCK_SIZE \
   --optim adafactor \
   --save_strategy no \
