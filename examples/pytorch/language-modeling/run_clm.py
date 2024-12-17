@@ -732,7 +732,7 @@ def main():
     if USE_EXPERT_PARALLELISM:
         assert model_args.gmm == 0, "expert parallel not supported with gmm yet"
         num_devices = xr.global_runtime_device_count()
-        expert_axis = config.num_local_experts
+        expert_axis = config.expert_parallel_axis
         fsdp_axis = num_devices // expert_axis
         mesh_shape = (fsdp_axis, expert_axis, 1)
         # Ignore tensor axis for now. It doesn't do anything.
@@ -749,7 +749,7 @@ def main():
             elif 'o_proj' in name:
                 xs.mark_sharding(param, spmd_mesh, ('fsdp', 'tensor'))
             elif 'w1' in name or 'w3' in name or 'w2' in name:
-                xs.mark_sharding(param, spmd_mesh, ('expert', None, None))
+                xs.mark_sharding(param, spmd_mesh, (('fsdp', 'expert'), None, None))
             elif 'lm_head' in name:
                 xs.mark_sharding(param, spmd_mesh, (('tensor', 'fsdp'), None))  # keep this fsdp.
 

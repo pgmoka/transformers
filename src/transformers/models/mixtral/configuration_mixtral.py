@@ -137,6 +137,7 @@ class MixtralConfig(PretrainedConfig):
         router_aux_loss_coef=0.001,
         router_jitter_noise=0.0,
         capacity_factor=0.0,
+        expert_parallel_axis=1,
         **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -165,6 +166,7 @@ class MixtralConfig(PretrainedConfig):
         self.router_aux_loss_coef = router_aux_loss_coef
         self.router_jitter_noise = router_jitter_noise
         self.capacity_factor = capacity_factor
+        self.expert_parallel_axis = expert_parallel_axis
         super().__init__(
             pad_token_id=pad_token_id,
             bos_token_id=bos_token_id,
