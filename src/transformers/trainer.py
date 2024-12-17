@@ -3561,6 +3561,9 @@ class Trainer:
         if is_sagemaker_mp_enabled():
             loss_mb = smp_forward_backward(model, inputs, self.args.gradient_accumulation_steps)
             return loss_mb.reduce_mean().detach().to(self.args.device)
+        
+        # Set a debug env var to find unexpected transfers to device.
+        os.environ["DEBUG_TRANSFER_IR_VALUE_TENSOR_TO_XLA_DATA"] = "1"
 
         with self.compute_loss_context_manager():
             loss = self.compute_loss(model, inputs)
@@ -3585,9 +3588,6 @@ class Trainer:
 
         kwargs = {}
         
-        # Set a debug env var to find unexpected transfers to device.
-        os.environ["DEBUG_TRANSFER_IR_VALUE_TENSOR_TO_XLA_DATA"] = "1"
-
         # For LOMO optimizers you need to explicitly use the learnign rate
         if self.args.optim in [OptimizerNames.LOMO, OptimizerNames.ADALOMO]:
             kwargs["learning_rate"] = self._get_learning_rate()
