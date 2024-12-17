@@ -2452,7 +2452,8 @@ class Trainer:
                     self.control = self.callback_handler.on_step_begin(args, self.state, self.control)
 
                 with self.accelerator.accumulate(model):
-                    tr_loss_step = self.training_step(model, inputs)
+                    with xp.Trace('loss_and_grad'):
+                        tr_loss_step = self.training_step(model, inputs)
 
                 if (
                     args.logging_nan_inf_filter
@@ -2516,7 +2517,8 @@ class Trainer:
 
                     self.control = self.callback_handler.on_pre_optimizer_step(args, self.state, self.control)
 
-                    self.optimizer.step()
+                    with xp.Trace('optimizer'):
+                        self.optimizer.step()
 
                     self.control = self.callback_handler.on_optimizer_step(args, self.state, self.control)
 
@@ -2526,7 +2528,8 @@ class Trainer:
                         if not isinstance(self.lr_scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
                             self.lr_scheduler.step()
 
-                    model.zero_grad()
+                    with xp.Trace('zero_grad'):
+                        model.zero_grad()
                     self.state.global_step += 1
                     self.state.epoch = epoch + (step + 1 + steps_skipped) / steps_in_epoch
                     self.control = self.callback_handler.on_step_end(args, self.state, self.control)

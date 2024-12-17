@@ -26,7 +26,7 @@ export XLA_IR_DEBUG=1
 export XLA_HLO_DEBUG=1
 export PROFILE_EPOCH=0
 export PROFILE_STEP=4
-export PROFILE_DURATION_MS=10000
+export PROFILE_DURATION_MS=20000
 export PROFILE_LOGDIR=/workspaces/torch/profile/scan-offload-ptxla
 
 mkdir -p /workspaces/torch/profile/scan-offload-ptxla
