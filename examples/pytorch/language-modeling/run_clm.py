@@ -56,6 +56,7 @@ from transformers.utils.versions import require_version
 import torch_xla
 import torch_xla.distributed.spmd as xs
 import torch_xla.runtime as xr
+import torch_xla.core.xla_model as xm
 
 # Will error if the minimal version of Transformers is not installed. Remove at your own risks.
 check_min_version("4.46.0.dev0")

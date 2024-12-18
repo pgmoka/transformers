@@ -883,6 +883,28 @@ class LlamaModel(LlamaPreTrainedModel):
         self.rotary_emb = LlamaRotaryEmbedding(config=config)
         self.gradient_checkpointing = False
         self.unroll_decoders = config.unroll_decoders
+        
+        class CurriedLayer(torch.nn.Module):
+            def __init__(self, decoder_layer):
+                super().__init__()
+                self.decoder_layer = decoder_layer
+
+            def forward(self, hidden_states, position_embeddings_0, position_embeddings_1, causal_mask):
+                hidden_states = offload_name(hidden_states, "decoder_input")
+                layer_outputs = self.decoder_layer(
+                    hidden_states,
+                    attention_mask=causal_mask,
+                    position_ids=None,
+                    past_key_value=None,
+                    output_attentions=False,
+                    use_cache=False,
+                    cache_position=None,
+                    position_embeddings=(position_embeddings_0, position_embeddings_1),
+                )
+                hidden_states = layer_outputs[0]
+                return hidden_states, position_embeddings_0, position_embeddings_1, causal_mask
+
+        self.curried_layers = [ CurriedLayer(l) for l in self.layers ]
 
         # Initialize weights and apply final processing
         self.post_init()
@@ -978,33 +1000,7 @@ class LlamaModel(LlamaPreTrainedModel):
 
             from torch_xla.experimental.scan_layers import scan_layers
 
-            # We thread `position_embeddings` and `causal_mask` through the layers because
-            # AOTAutograd can't trace free variable accesses.
-            class CurriedLayer(torch.nn.Module):
-                def __init__(self, decoder_layer, position_embeddings, causal_mask):
-                    super().__init__()
-                    self.decoder_layer = decoder_layer
-                    self.position_embeddings_0 = nn.Buffer(position_embeddings[0])
-                    self.position_embeddings_1 = nn.Buffer(position_embeddings[1])
-                    self.causal_mask = nn.Buffer(causal_mask)
-
-                def forward(self, hidden_states):
-                    hidden_states = offload_name(hidden_states, "decoder_input")
-                    layer_outputs = self.decoder_layer(
-                        hidden_states,
-                        attention_mask=self.causal_mask,
-                        position_ids=position_ids,
-                        past_key_value=past_key_values,
-                        output_attentions=output_attentions,
-                        use_cache=use_cache,
-                        cache_position=cache_position,
-                        position_embeddings=(self.position_embeddings_0, self.position_embeddings_1),
-                    )
-                    hidden_states = layer_outputs[0]
-                    return hidden_states
-
-            curried_layers = [ CurriedLayer(l, position_embeddings, causal_mask) for l in self.layers ]
-            hidden_states = scan_layers(curried_layers, hidden_states, partition_fn=remat_all_offload_decoder_input)
+            hidden_states, *_rest = scan_layers(self.curried_layers, (hidden_states, position_embeddings[0], position_embeddings[1], causal_mask), partition_fn=remat_all_offload_decoder_input)
         else:
             self.log_once("NOTE: Using for loop to run decoder layers")
 

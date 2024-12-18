@@ -38,6 +38,7 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple, Un
 
 import torch_xla
 import torch_xla.debug.profiler as xp
+import torch_xla.core.xla_model as xm
 
 
 # Integrations must be imported before ML frameworks:
@@ -2411,6 +2412,9 @@ class Trainer:
             step = -1
             for step, inputs in enumerate(epoch_iterator):
                 total_batched_samples += 1
+                
+                if step > 5:
+                    os.environ["DEBUG_LARGE_TRANSFER"] = "1"
 
                 if self.args.include_num_input_tokens_seen:
                     main_input_name = getattr(self.model, "main_input_name", "input_ids")
@@ -2560,6 +2564,8 @@ class Trainer:
                     f" num_steps ({max_steps}) higher than the number of available samples."
                 )
                 self.control.should_training_stop = True
+                
+            del os.environ["DEBUG_LARGE_TRANSFER"]
 
             self.control = self.callback_handler.on_epoch_end(args, self.state, self.control)
             self._maybe_log_save_evaluate(tr_loss, grad_norm, model, trial, epoch, ignore_keys_for_eval)
@@ -3566,7 +3572,7 @@ class Trainer:
             return loss_mb.reduce_mean().detach().to(self.args.device)
         
         # Set a debug env var to find unexpected transfers to device.
-        os.environ["DEBUG_TRANSFER_IR_VALUE_TENSOR_TO_XLA_DATA"] = "1"
+        # os.environ["DEBUG_TRANSFER_IR_VALUE_TENSOR_TO_XLA_DATA"] = "1"
 
         with self.compute_loss_context_manager():
             loss = self.compute_loss(model, inputs)
@@ -3605,7 +3611,7 @@ class Trainer:
             with xp.Trace('backward'):
                 self.accelerator.backward(loss, **kwargs)
                 
-        del os.environ["DEBUG_TRANSFER_IR_VALUE_TENSOR_TO_XLA_DATA"]
+        # del os.environ["DEBUG_TRANSFER_IR_VALUE_TENSOR_TO_XLA_DATA"]
 
         return loss.detach() / self.args.gradient_accumulation_steps
 
