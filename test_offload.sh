@@ -35,7 +35,7 @@ export XLA_SAVE_TENSORS_FILE=ir_dumps/scan-offload-ptxla.txt
 export XLA_SAVE_TENSORS_FMT=hlo
 export XLA_FLAGS=--xla_dump_to=xla_dumps/scan-offload-ptxla
 
-BLOCK_SIZE=4096
+BLOCK_SIZE=8192
 EXTRA='--flash_attention'
 
 cat << EOF > /workspaces/torch/model_config.json
@@ -91,4 +91,4 @@ python3 examples/pytorch/language-modeling/run_clm.py \
   --torch_dtype bfloat16 \
   --dataloader_drop_last yes \
   --spmd_2d_sharding 2 \
-  --max_steps 500 $EXTRA
+  --max_steps 1000 $EXTRA
