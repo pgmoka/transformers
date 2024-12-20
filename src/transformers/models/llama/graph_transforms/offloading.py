@@ -58,11 +58,14 @@ def remat_all_and_offload_these_inputs(
 
   fw_name_in_output_indices = get_name_in_output_indices(fwd)
   bw_name_in_input_names = get_name_in_input_names(bwd)
-
+  
   for name in names_to_offload:
     print(f"Going to offload {name}")
     assert name in fw_name_in_output_indices
     assert name in bw_name_in_input_names
+    
+  print("fw_name_in_output_indices", fw_name_in_output_indices)
+  print("bw_name_in_input_names", bw_name_in_input_names)
 
   with torch.no_grad():
 

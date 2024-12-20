@@ -470,8 +470,8 @@ def main():
         import psutil
         print('before model init RAM Used (GB):', psutil.virtual_memory()[3]/1000000000)
         device = torch_xla.device()
-        meta_device = torch.device('meta')
-        with meta_device:
+        first_init_device = torch.device('meta') if model_args.spmd_2d_sharding > 0 else torch_xla.device()
+        with first_init_device:
             model = AutoModelForCausalLM.from_config(config, trust_remote_code=model_args.trust_remote_code)
         # note: at this point, the mode is not materialized
         print('after model init RAM Used (GB):', psutil.virtual_memory()[3]/1000000000)
@@ -569,13 +569,13 @@ def main():
                 "`use_cache=True` is incompatible with gradient checkpointing. Setting `use_cache=False`."
             )
             model.config.use_cache = False
-            
-        # Activate scan
-        model.model.unroll_decoders = False
-        # model.model.unroll_decoders = True
+        
+    # Activate scan
+    model.model.unroll_decoders = False
+    # model.model.unroll_decoders = True
 
-        # Materialize all weights after 2d sharding
-        torch_xla.sync()
+    # Materialize all weights after 2d sharding
+    torch_xla.sync()
 
     import torch_xla.debug.metrics as met
     print("=================== Start metrics after materializing model ===================")

@@ -63,6 +63,7 @@ if is_flash_attn_2_available():
 
 import torch_xla.debug.profiler as xp
 from torch_xla.distributed.spmd.xla_sharding import XLAPatchedLinear, xla_patched_nn_linear_forward
+import torch_xla.distributed.spmd
 
 logger = logging.get_logger(__name__)
 
@@ -954,6 +955,9 @@ class LlamaModel(LlamaPreTrainedModel):
                 "`use_cache=True` is incompatible with gradient checkpointing. Setting `use_cache=False`."
             )
             use_cache = False
+            
+        spmd_mesh = torch_xla.distributed.spmd.get_global_mesh()
+        torch_xla.distributed.spmd.mark_sharding(input_ids, spmd_mesh, ('fsdp', None))
 
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
