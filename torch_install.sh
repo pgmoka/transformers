@@ -1,5 +1,5 @@
 #!/bin/bash
-cd transformers
+# cd transformers
 pip3 install git+file://$PWD
 pip3 install accelerate datasets evaluate scikit-learn huggingface-hub
 pip3 install torch==2.6.0.dev20241209+cpu.cxx11.abi --index-url https://download.pytorch.org/whl/nightly
