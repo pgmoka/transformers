@@ -2565,7 +2565,8 @@ class Trainer:
                 )
                 self.control.should_training_stop = True
                 
-            del os.environ["DEBUG_LARGE_TRANSFER"]
+            if "DEBUG_LARGE_TRANSFER" in os.environ:
+                del os.environ["DEBUG_LARGE_TRANSFER"]
 
             self.control = self.callback_handler.on_epoch_end(args, self.state, self.control)
             self._maybe_log_save_evaluate(tr_loss, grad_norm, model, trial, epoch, ignore_keys_for_eval)
