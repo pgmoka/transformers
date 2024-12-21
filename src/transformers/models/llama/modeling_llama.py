@@ -1291,6 +1291,8 @@ class LlamaForCausalLM(LlamaPreTrainedModel, GenerationMixin):
         else:
             # Only compute necessary logits, and do not upcast them to float if we are not computing the loss
             logits = self.lm_head(hidden_states[:, -num_logits_to_keep:, :])
+            spmd_mesh = torch_xla.distributed.spmd.get_global_mesh()
+            torch_xla.distributed.spmd.mark_sharding(logits, spmd_mesh, (('fsdp', 'tensor'), None, None))
 
         loss = None
         if labels is not None:
