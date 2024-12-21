@@ -91,7 +91,7 @@ python3 examples/pytorch/language-modeling/run_clm.py \
   --torch_dtype bfloat16 \
   --dataloader_drop_last yes \
   --spmd_2d_sharding 2 \
-  --max_steps 10 $EXTRA
+  --max_steps 100 $EXTRA
 
 
 #  --fsdp "full_shard" \
