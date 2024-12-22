@@ -35,9 +35,6 @@ export XLA_SAVE_TENSORS_FILE=ir_dumps/scan-offload-ptxla.txt
 export XLA_SAVE_TENSORS_FMT=hlo
 export XLA_FLAGS=--xla_dump_to=xla_dumps/scan-offload-ptxla
 
-BLOCK_SIZE=8192
-EXTRA='--flash_attention'
-
 cat << EOF > /workspaces/torch/model_config.json
 {
     "architectures": [
@@ -68,6 +65,8 @@ cat << EOF > /workspaces/torch/model_config.json
 }
 EOF
 
+BLOCK_SIZE=8192
+
 # Debugging notes:
 # set print object on
 # set print vtbl on
@@ -90,9 +89,10 @@ python3 examples/pytorch/language-modeling/run_clm.py \
   --logging_strategy no \
   --torch_dtype bfloat16 \
   --dataloader_drop_last yes \
+  --flash_attention \
   --spmd_2d_sharding 2 \
-  --max_steps 100 $EXTRA
+  --max_steps 50
 
-
+#  --spmd_2d_sharding 2 \
 #  --fsdp "full_shard" \
 #  --fsdp_config fsdp_config.json \
