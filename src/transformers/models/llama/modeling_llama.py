@@ -956,8 +956,8 @@ class LlamaModel(LlamaPreTrainedModel):
             )
             use_cache = False
             
-        spmd_mesh = torch_xla.distributed.spmd.get_global_mesh()
-        torch_xla.distributed.spmd.mark_sharding(input_ids, spmd_mesh, ('fsdp', None))
+        # spmd_mesh = torch_xla.distributed.spmd.get_global_mesh()
+        # torch_xla.distributed.spmd.mark_sharding(input_ids, spmd_mesh, ('fsdp', None))
 
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
@@ -1291,11 +1291,12 @@ class LlamaForCausalLM(LlamaPreTrainedModel, GenerationMixin):
         else:
             # Only compute necessary logits, and do not upcast them to float if we are not computing the loss
             logits = self.lm_head(hidden_states[:, -num_logits_to_keep:, :])
-            spmd_mesh = torch_xla.distributed.spmd.get_global_mesh()
-            torch_xla.distributed.spmd.mark_sharding(logits, spmd_mesh, ('fsdp', None, 'tensor'))
+            # spmd_mesh = torch_xla.distributed.spmd.get_global_mesh()
+            # torch_xla.distributed.spmd.mark_sharding(logits, spmd_mesh, ('fsdp', None, 'tensor'))
 
         loss = None
         if labels is not None:
+            # torch_xla.distributed.spmd.mark_sharding(labels, spmd_mesh, ('fsdp', None))
             # Upcast to float if we need to compute the loss to avoid potential precision issues
             logits = logits.float()
             # Shift so that tokens < n predict n
