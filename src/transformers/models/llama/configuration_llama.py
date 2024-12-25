@@ -167,6 +167,7 @@ class LlamaConfig(PretrainedConfig):
         mlp_bias=False,
         head_dim=None,
         unroll_decoders=False,
+        scan_bw_output_sharder=None,
         **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -194,6 +195,7 @@ class LlamaConfig(PretrainedConfig):
         self.head_dim = head_dim if head_dim is not None else self.hidden_size // self.num_attention_heads
 
         self.unroll_decoders = unroll_decoders
+        self.scan_bw_output_sharder = scan_bw_output_sharder
 
         # Validate the correctness of rotary position embeddings parameters
         # BC: if there is a 'type' field, copy it it to 'rope_type'.

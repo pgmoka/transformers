@@ -884,6 +884,7 @@ class LlamaModel(LlamaPreTrainedModel):
         self.rotary_emb = LlamaRotaryEmbedding(config=config)
         self.gradient_checkpointing = False
         self.unroll_decoders = config.unroll_decoders
+        self.scan_bw_output_sharder = config.scan_bw_output_sharder
         
         class CurriedLayer(torch.nn.Module):
             def __init__(self, decoder_layer):
@@ -956,8 +957,8 @@ class LlamaModel(LlamaPreTrainedModel):
             )
             use_cache = False
             
-        # spmd_mesh = torch_xla.distributed.spmd.get_global_mesh()
-        # torch_xla.distributed.spmd.mark_sharding(input_ids, spmd_mesh, ('fsdp', None))
+        spmd_mesh = torch_xla.distributed.spmd.get_global_mesh()
+        torch_xla.distributed.spmd.mark_sharding(input_ids, spmd_mesh, ('fsdp', None))
 
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
@@ -1003,6 +1004,8 @@ class LlamaModel(LlamaPreTrainedModel):
             self.log_once("NOTE: Using scan_layers to speed up compilation")
 
             from torch_xla.experimental.scan_layers import scan_layers
+            from torch_xla.experimental.scan import scan_bw_output_sharder
+            scan_bw_output_sharder[0] = self.scan_bw_output_sharder
 
             hidden_states, *_rest = scan_layers(self.curried_layers, (hidden_states, position_embeddings[0], position_embeddings[1], causal_mask), partition_fn=remat_all_offload_decoder_input)
         else:
@@ -1045,6 +1048,7 @@ class LlamaModel(LlamaPreTrainedModel):
                     all_self_attns += (layer_outputs[1],)
 
         hidden_states = self.norm(hidden_states)
+        torch_xla.distributed.spmd.mark_sharding(hidden_states, spmd_mesh, ('fsdp', None, 'tensor'))
 
         # add hidden states from the last decoder layer
         if output_hidden_states:
@@ -1290,13 +1294,14 @@ class LlamaForCausalLM(LlamaPreTrainedModel, GenerationMixin):
             logits = torch.cat(logits, dim=-1)
         else:
             # Only compute necessary logits, and do not upcast them to float if we are not computing the loss
+            spmd_mesh = torch_xla.distributed.spmd.get_global_mesh()
+            torch_xla.distributed.spmd.mark_sharding(hidden_states, spmd_mesh, ('fsdp', None, 'tensor'))
             logits = self.lm_head(hidden_states[:, -num_logits_to_keep:, :])
-            # spmd_mesh = torch_xla.distributed.spmd.get_global_mesh()
-            # torch_xla.distributed.spmd.mark_sharding(logits, spmd_mesh, ('fsdp', None, 'tensor'))
+            spmd_mesh = torch_xla.distributed.spmd.get_global_mesh()
+            torch_xla.distributed.spmd.mark_sharding(logits, spmd_mesh, ('fsdp', None, 'tensor'))
 
         loss = None
         if labels is not None:
-            # torch_xla.distributed.spmd.mark_sharding(labels, spmd_mesh, ('fsdp', None))
             # Upcast to float if we need to compute the loss to avoid potential precision issues
             logits = logits.float()
             # Shift so that tokens < n predict n

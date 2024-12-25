@@ -57,6 +57,7 @@ import torch_xla
 import torch_xla.distributed.spmd as xs
 import torch_xla.runtime as xr
 import torch_xla.core.xla_model as xm
+import torch_xla.distributed.spmd
 
 # Will error if the minimal version of Transformers is not installed. Remove at your own risks.
 check_min_version("4.46.0.dev0")
@@ -493,11 +494,9 @@ def main():
 
     if num_slices > 1 and model_args.spmd_2d_sharding == 0:
         raise ValueError("Multi-slice training requires SPMD 2D sharding")
-
-    import torch_xla.debug.metrics as met
-    print("=================== Start metrics before materializing model ===================")
-    print(met.metrics_report())
-    print("=================== End metrics before materializing model ===================")
+    
+    up_proj_shape = None
+    down_proj_shape = None
 
     # Apply 2D sharding.
     # We apply sharding annotations before running the tokenizer, since
@@ -543,17 +542,19 @@ def main():
 
             # Here we intentionally skip layernorm and moe.gate weights given they are small.
             if 'embed_tokens' in name:
-                xs.mark_sharding(param, spmd_mesh, ('fsdp', 'tensor'))  # needed to have activations fully sharded.
+                xs.mark_sharding(param, spmd_mesh, ('tensor', 'fsdp'))
             elif 'q_proj' in name or 'k_proj' in name or 'v_proj' in name:
                 xs.mark_sharding(param, spmd_mesh, ('tensor', 'fsdp'))
             elif 'o_proj' in name:
                 xs.mark_sharding(param, spmd_mesh, ('fsdp', 'tensor'))
             elif 'gate_proj' in name or 'up_proj' in name:
                 xs.mark_sharding(param, spmd_mesh, ('tensor', 'fsdp'))
+                up_proj_shape = param.shape
             elif 'down_proj' in name:
                 xs.mark_sharding(param, spmd_mesh, ('fsdp', 'tensor'))
+                down_proj_shape = param.shape
             elif 'lm_head' in name:
-                xs.mark_sharding(param, spmd_mesh, (('tensor', 'fsdp'), None))  # keep this fsdp.
+                xs.mark_sharding(param, spmd_mesh, ('tensor', 'fsdp'))
 
             print(f'{name} {torch_xla._XLAC._get_xla_sharding_spec(param)}')
             torch_xla.sync()
@@ -572,15 +573,29 @@ def main():
         
     # Activate scan
     model.model.unroll_decoders = False
-    # model.model.unroll_decoders = True
+    
+    def bw_output_sharder(empty):
+        print(f"bw output sharder saw: {empty.shape}")
+        if not len(empty.shape) == 3:
+            return empty
+        spmd_mesh = torch_xla.distributed.spmd.get_global_mesh()
+        if up_proj_shape is None or down_proj_shape is None:
+            return empty
+        if empty.shape[1] == down_proj_shape[0] and empty.shape[2] == down_proj_shape[1]:
+            print(f"Sharding the gradient of down proj {empty.shape}")
+            torch_xla.distributed.spmd.mark_sharding(empty, spmd_mesh,
+                                                     (None, 'fsdp', 'tensor'))
+        elif empty.shape[1] == up_proj_shape[0] and empty.shape[2] == up_proj_shape[1]:
+            print(f"Sharding the gradient of up proj {empty.shape}")
+            torch_xla.distributed.spmd.mark_sharding(empty, spmd_mesh,
+                                                     (None, 'tensor', 'fsdp'))
+        return empty
+    
+    # HACK: explicitly shard the gradients of some weights
+    model.model.scan_bw_output_sharder = bw_output_sharder
 
     # Materialize all weights after 2d sharding
     torch_xla.sync()
-
-    import torch_xla.debug.metrics as met
-    print("=================== Start metrics after materializing model ===================")
-    print(met.metrics_report())
-    print("=================== End metrics after materializing model ===================")
 
     # Preprocessing the datasets.
     # First we tokenize all the texts.
