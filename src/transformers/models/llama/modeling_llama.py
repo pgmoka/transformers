@@ -891,8 +891,14 @@ class LlamaModel(LlamaPreTrainedModel):
                 super().__init__()
                 self.decoder_layer = decoder_layer
 
-            def forward(self, hidden_states, position_embeddings_0, position_embeddings_1, causal_mask):
+            def forward(self, hidden_states, position_embeddings_0, position_embeddings_1):
                 hidden_states = offload_name(hidden_states, "decoder_input")
+                # HACK: generate a small causal mask that is shared overall batches of data.
+                sequence_length = hidden_states.shape[1]
+                causal_mask = torch.triu(
+                    torch.ones((sequence_length, sequence_length), device=hidden_states.device, dtype=hidden_states.dtype),
+                    diagonal=1,
+                )
                 layer_outputs = self.decoder_layer(
                     hidden_states,
                     attention_mask=causal_mask,
@@ -904,7 +910,7 @@ class LlamaModel(LlamaPreTrainedModel):
                     position_embeddings=(position_embeddings_0, position_embeddings_1),
                 )
                 hidden_states = layer_outputs[0]
-                return hidden_states, position_embeddings_0, position_embeddings_1, causal_mask
+                return hidden_states, position_embeddings_0, position_embeddings_1
 
         self.curried_layers = [ CurriedLayer(l) for l in self.layers ]
 
@@ -985,9 +991,6 @@ class LlamaModel(LlamaPreTrainedModel):
         if position_ids is None:
             position_ids = cache_position.unsqueeze(0)
 
-        causal_mask = self._update_causal_mask(
-            attention_mask, inputs_embeds, cache_position, past_key_values, output_attentions
-        )
         hidden_states = inputs_embeds
 
         # create position embeddings to be shared across the decoder layers
@@ -1007,9 +1010,13 @@ class LlamaModel(LlamaPreTrainedModel):
             from torch_xla.experimental.scan import scan_bw_output_sharder
             scan_bw_output_sharder[0] = self.scan_bw_output_sharder
 
-            hidden_states, *_rest = scan_layers(self.curried_layers, (hidden_states, position_embeddings[0], position_embeddings[1], causal_mask), partition_fn=remat_all_offload_decoder_input)
+            hidden_states, *_rest = scan_layers(self.curried_layers, (hidden_states, position_embeddings[0], position_embeddings[1]), partition_fn=remat_all_offload_decoder_input)
         else:
             self.log_once("NOTE: Using for loop to run decoder layers")
+
+            causal_mask = self._update_causal_mask(
+                attention_mask, inputs_embeds, cache_position, past_key_values, output_attentions
+            )
 
             for decoder_layer in self.layers:
                 if output_hidden_states:
