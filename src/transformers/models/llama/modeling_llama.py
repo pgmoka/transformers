@@ -414,6 +414,8 @@ class LlamaAttention(nn.Module):
 
         attn_output = attn_output.reshape(bsz, q_len, -1)
 
+        attn_output = aot_mark_sharding(attn_output, partition_spec="('fsdp', None, 'tensor')")
+
         if self.config.pretraining_tp > 1:
             attn_output = attn_output.split(self.hidden_size // self.config.pretraining_tp, dim=2)
             o_proj_slices = self.o_proj.weight.split(self.hidden_size // self.config.pretraining_tp, dim=1)
@@ -423,8 +425,37 @@ class LlamaAttention(nn.Module):
 
         if not output_attentions:
             attn_weights = None
+        
+        attn_output = aot_mark_sharding(attn_output, partition_spec="('fsdp', None, 'tensor')")
 
         return attn_output, attn_weights, past_key_value
+    
+
+@torch.library.custom_op("xla::aot_mark_sharding", mutates_args=())
+def aot_mark_sharding(t: torch.Tensor, partition_spec: str) -> torch.Tensor:
+  if t is None:
+    return None
+  import ast
+  mesh = torch_xla.distributed.spmd.get_global_mesh()
+  partition_spec_eval = ast.literal_eval(partition_spec)
+  torch_xla.distributed.spmd.mark_sharding(
+      t, mesh, partition_spec_eval)
+  return t.clone()
+
+
+@aot_mark_sharding.register_fake
+def aot_mark_sharding_fake(t: torch.Tensor, partition_spec: str) -> torch.Tensor:
+  if t is None:
+    return None
+  return torch.empty_like(t)
+  
+
+def aot_mark_sharding_backward(ctx, grad):
+  return grad, None
+
+
+aot_mark_sharding.register_autograd(aot_mark_sharding_backward)
+
 
 
 class LlamaFlashAttention2(LlamaAttention):
