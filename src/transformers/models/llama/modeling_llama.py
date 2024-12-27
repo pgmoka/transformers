@@ -71,8 +71,20 @@ _CONFIG_FOR_DOC = "LlamaConfig"
 
 
 class XlaLinear(nn.Linear):
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        bias: bool = True,
+        weight_sharding_spec: Optional[str] = None
+    ):
+        super().__init__(
+            in_features=in_features, out_features=out_features, bias=bias,
+        )
+        self._weight_sharding_spec = weight_sharding_spec
+
     def forward(self, input):
-        return xla_patched_nn_linear_forward(self, input)
+        return xla_patched_nn_linear_forward(self, input, weight_sharding_spec=self._weight_sharding_spec)
 
 
 class LlamaRMSNorm(nn.Module):
@@ -319,7 +331,7 @@ class LlamaAttention(nn.Module):
         self.q_proj = XlaLinear(self.hidden_size, self.num_heads * self.head_dim, bias=config.attention_bias)
         self.k_proj = XlaLinear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=config.attention_bias)
         self.v_proj = XlaLinear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=config.attention_bias)
-        self.o_proj = XlaLinear(self.num_heads * self.head_dim, self.hidden_size, bias=config.attention_bias)
+        self.o_proj = XlaLinear(self.num_heads * self.head_dim, self.hidden_size, bias=config.attention_bias, weight_sharding_spec="('fsdp', 'tensor')")
 
         # TODO (joao): remove in v4.46 (RoPE is computed in the model, not in the decoder layers)
         self.rotary_emb = LlamaRotaryEmbedding(config=self.config)

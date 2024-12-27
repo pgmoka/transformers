@@ -495,6 +495,10 @@ def main():
     if num_slices > 1 and model_args.spmd_2d_sharding == 0:
         raise ValueError("Multi-slice training requires SPMD 2D sharding")
     
+    q_proj_shape = None
+    k_proj_shape = None
+    v_proj_shape = None
+    o_proj_shape = None
     up_proj_shape = None
     down_proj_shape = None
 
@@ -544,8 +548,15 @@ def main():
             if 'embed_tokens' in name:
                 xs.mark_sharding(param, spmd_mesh, ('tensor', 'fsdp'))
             elif 'q_proj' in name or 'k_proj' in name or 'v_proj' in name:
+                if 'q_proj' in name:
+                    q_proj_shape = param.shape
+                elif 'k_proj' in name:
+                    k_proj_shape = param.shape
+                elif 'v_proj' in name:
+                    v_proj_shape = param.shape
                 xs.mark_sharding(param, spmd_mesh, ('tensor', 'fsdp'))
             elif 'o_proj' in name:
+                o_proj_shape = param.shape
                 xs.mark_sharding(param, spmd_mesh, ('fsdp', 'tensor'))
             elif 'gate_proj' in name or 'up_proj' in name:
                 xs.mark_sharding(param, spmd_mesh, ('tensor', 'fsdp'))
@@ -574,21 +585,43 @@ def main():
     # Activate scan
     model.model.unroll_decoders = False
     
+    # HACK x3: use a counter to identify the bw output: is it
+    # the gradient for q, k, v, or o projection.
+    hack_arg_counter = 0
+    
     def bw_output_sharder(empty):
+        nonlocal hack_arg_counter 
         print(f"bw output sharder saw: {empty.shape}")
+        hack_arg_counter = hack_arg_counter + 1
         if not len(empty.shape) == 3:
             return empty
         spmd_mesh = torch_xla.distributed.spmd.get_global_mesh()
         if up_proj_shape is None or down_proj_shape is None:
             return empty
         if empty.shape[1] == down_proj_shape[0] and empty.shape[2] == down_proj_shape[1]:
-            print(f"Sharding the gradient of down proj {empty.shape}")
+            print(f"Sharding the gradient of down_proj {empty.shape}")
             torch_xla.distributed.spmd.mark_sharding(empty, spmd_mesh,
                                                      (None, 'fsdp', 'tensor'))
         elif empty.shape[1] == up_proj_shape[0] and empty.shape[2] == up_proj_shape[1]:
-            print(f"Sharding the gradient of up proj {empty.shape}")
+            print(f"Sharding the gradient of up_proj {empty.shape}")
             torch_xla.distributed.spmd.mark_sharding(empty, spmd_mesh,
                                                      (None, 'tensor', 'fsdp'))
+        elif empty.shape[1] == q_proj_shape[0] and empty.shape[2] == q_proj_shape[1] and hack_arg_counter == 1:
+            print(f"Sharding the gradient of q_proj {empty.shape}")
+            torch_xla.distributed.spmd.mark_sharding(empty, spmd_mesh,
+                                                     (None, 'tensor', 'fsdp'))
+        elif empty.shape[1] == k_proj_shape[0] and empty.shape[2] == k_proj_shape[1] and hack_arg_counter == 2:
+            print(f"Sharding the gradient of k_proj {empty.shape}")
+            torch_xla.distributed.spmd.mark_sharding(empty, spmd_mesh,
+                                                     (None, 'tensor', 'fsdp'))
+        elif empty.shape[1] == v_proj_shape[0] and empty.shape[2] == v_proj_shape[1] and hack_arg_counter == 3:
+            print(f"Sharding the gradient of v_proj {empty.shape}")
+            torch_xla.distributed.spmd.mark_sharding(empty, spmd_mesh,
+                                                     (None, 'tensor', 'fsdp'))
+        elif empty.shape[1] == o_proj_shape[0] and empty.shape[2] == o_proj_shape[1] and hack_arg_counter == 4:
+            print(f"Sharding the gradient of o_proj {empty.shape}")
+            torch_xla.distributed.spmd.mark_sharding(empty, spmd_mesh,
+                                                     (None, 'fsdp', 'tensor'))
         return empty
     
     # HACK: explicitly shard the gradients of some weights
