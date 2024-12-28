@@ -628,7 +628,8 @@ def main():
     model.model.scan_bw_output_sharder = bw_output_sharder
 
     # Materialize all weights after 2d sharding
-    torch_xla.sync()
+    torch_xla.sync(wait=True)
+    xm.wait_device_ops()
 
     # Preprocessing the datasets.
     # First we tokenize all the texts.

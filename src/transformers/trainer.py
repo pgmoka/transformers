@@ -2546,8 +2546,10 @@ class Trainer:
                     # Wait until device execution catches up to tracing before triggering the profile. This will
                     # interrupt training slightly on the hosts which are capturing, but by waiting after tracing
                     # for the step, the interruption will be minimal.
+                    print("About to start profiling. Wait for device execution to catch up first.", flush=True)
                     xm.wait_device_ops()
                     import tempfile
+                    print("Starting profiling...", flush=True)
                     xp.trace_detached('127.0.0.1:9012', profile_logdir or tempfile.mkdtemp(), profile_duration or 20000)
 
                 if self.control.should_epoch_stop or self.control.should_training_stop:
