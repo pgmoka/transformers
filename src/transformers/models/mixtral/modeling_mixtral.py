@@ -304,6 +304,8 @@ class MixtralAttention(nn.Module):
         self.is_causal = True
         self.attention_dropout = config.attention_dropout
 
+        self.flash_attention = getattr(config, "flash_attention", True)
+
         if (self.head_dim * self.num_heads) != self.hidden_size:
             raise ValueError(
                 f"hidden_size must be divisible by num_heads (got `hidden_size`: {self.hidden_size}"
@@ -368,7 +370,7 @@ class MixtralAttention(nn.Module):
         key_states = repeat_kv(key_states, self.num_key_value_groups)
         value_states = repeat_kv(value_states, self.num_key_value_groups)
 
-        if not self.config.flash_attention:
+        if not self.flash_attention:
             attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
 
             if attn_weights.size() != (bsz, self.num_heads, q_len, kv_seq_len):
@@ -850,8 +852,8 @@ class MixtralSparseMoeBlock(nn.Module):
         self.ffn_dim = config.intermediate_size
         self.num_experts = config.num_local_experts
         self.top_k = config.num_experts_per_tok
-        self.static = config.static
-        self.capacity_factor = config.capacity_factor
+        self.static = getattr(config, 'static', True)
+        self.capacity_factor = getattr(config, 'capacity_factor', -1)
         self.reuse_hidden_states = False
 
         # gating
