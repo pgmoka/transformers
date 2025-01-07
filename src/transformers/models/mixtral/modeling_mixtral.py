@@ -398,7 +398,8 @@ class MixtralAttention(nn.Module):
             partition_spec = None
             if xs.get_global_mesh() is not None:
                 partition_spec = ('fsdp', 'tensor', None, None)
-            attn_output = flash_attention(query_states, key_states, value_states, causal=True, partition_spec=partition_spec)
+            attention_mask = attention_mask.expand(bsz, self.num_heads, q_len, kv_seq_len)
+            attn_output = flash_attention(query_states, key_states, value_states, ab=attention_mask, causal=True, partition_spec=partition_spec)
 
         if attn_output.size() != (bsz, self.num_heads, q_len, self.head_dim):
             raise ValueError(
