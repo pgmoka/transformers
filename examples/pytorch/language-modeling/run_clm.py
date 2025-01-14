@@ -717,18 +717,6 @@ def main():
         for i, block in enumerate(model.model.layers):
             model.model.layers[i] = checkpoint_module(block)
 
-    # Initialize our Trainer
-    trainer = Trainer(
-        model=model,
-        args=training_args,
-        train_dataset=train_dataset if training_args.do_train else None,
-        eval_dataset=eval_dataset if training_args.do_eval else None,
-        tokenizer=tokenizer,
-        # Data collator will default to DataCollatorWithPadding, so we change it.
-        data_collator=default_data_collator,
-        compute_metrics=compute_metrics if training_args.do_eval and not is_torch_xla_available() else None,
-    )
-
     if USE_EXPERT_PARALLELISM:
         assert model_args.gmm == 0, "expert parallel not supported with gmm yet"
         num_devices = xr.global_runtime_device_count()
@@ -738,20 +726,22 @@ def main():
         # Ignore tensor axis for now. It doesn't do anything.
         spmd_mesh = xs.Mesh(range(num_devices), mesh_shape, ('fsdp', 'expert', 'tensor'))
         xs.set_global_mesh(spmd_mesh)
+
+        model.to('xla')
         for name, param in model.named_parameters():
             print('> [Expert parallel] Sharding tensor', name, param.shape)
 
             # Here we intentionally skip layernorm and moe.gate weights given they are small.
             if 'embed_tokens' in name:
-                xs.mark_sharding(param, spmd_mesh, ('fsdp', 'tensor'))  # needed to have activations fully sharded.
+                xs.mark_sharding(param, spmd_mesh, (None, ('fsdp', 'expert')))  # needed to have activations fully sharded.
             elif 'q_proj' in name or 'k_proj' in name or 'v_proj' in name:
-                xs.mark_sharding(param, spmd_mesh, ('tensor', 'fsdp'))
+                xs.mark_sharding(param, spmd_mesh, ('tensor', ('fsdp', 'expert')))
             elif 'o_proj' in name:
-                xs.mark_sharding(param, spmd_mesh, ('fsdp', 'tensor'))
+                xs.mark_sharding(param, spmd_mesh, (('fsdp', 'expert'), 'tensor'))
             elif 'w1' in name or 'w3' in name or 'w2' in name:
-                xs.mark_sharding(param, spmd_mesh, (('fsdp', 'expert'), None, None))
+                xs.mark_sharding(param, spmd_mesh, ('expert', None, None))
             elif 'lm_head' in name:
-                xs.mark_sharding(param, spmd_mesh, (('tensor', 'fsdp'), None))  # keep this fsdp.
+                xs.mark_sharding(param, spmd_mesh, (('tensor', 'fsdp', 'expert'), None))  # keep this fsdp.
 
             print(f'{name} {torch_xla._XLAC._get_xla_sharding_spec(param)}')
 
@@ -767,6 +757,18 @@ def main():
         from torch_xla.distributed.fsdp import checkpoint_module
         for i, block in enumerate(model.model.layers):
             model.model.layers[i] = checkpoint_module(block)
+
+    # Initialize our Trainer
+    trainer = Trainer(
+        model=model,
+        args=training_args,
+        train_dataset=train_dataset if training_args.do_train else None,
+        eval_dataset=eval_dataset if training_args.do_eval else None,
+        tokenizer=tokenizer,
+        # Data collator will default to DataCollatorWithPadding, so we change it.
+        data_collator=default_data_collator,
+        compute_metrics=compute_metrics if training_args.do_eval and not is_torch_xla_available() else None,
+    )
 
     # Training
     if training_args.do_train:
