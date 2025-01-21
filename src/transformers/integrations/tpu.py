@@ -13,6 +13,7 @@
 # limitations under the License.
 
 from torch.utils.data import DataLoader
+import os
 
 from ..utils import is_torch_xla_available
 
