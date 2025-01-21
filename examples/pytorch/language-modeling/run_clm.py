@@ -673,6 +673,7 @@ def main():
         if training_args.do_eval and not is_torch_xla_available()
         else None,
     )
+    os.environ["USE_SINGLE_SLICE"] = "1"
 
     # Training
     if training_args.do_train:

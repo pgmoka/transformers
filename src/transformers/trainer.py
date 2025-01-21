@@ -263,6 +263,7 @@ if TYPE_CHECKING:
         import datasets
 
 logger = logging.get_logger(__name__)
+NUM_TPU_SLICE = int(os.environ.get('NUM_TPU_SLICE', 1))
 
 
 # Name of the files used for checkpointing
@@ -678,7 +679,14 @@ class Trainer:
             # Prepare the SPMD mesh that is going to be used by the data loader and the FSDPv2 wrapper.
             # Tensor axis is just a placeholder where it will not be used in FSDPv2.
             num_devices = xr.global_runtime_device_count()
-            xs.set_global_mesh(xs.Mesh(np.array(range(num_devices)), (num_devices, 1), axis_names=("fsdp", "tensor")))
+            if NUM_TPU_SLICE > 1:
+                dcn_axis = NUM_TPU_SLICE
+                ici_mesh_shape = (1, num_devices // dcn_axis, 1)
+                dcn_mesh_shape = (dcn_axis, 1, 1)
+                mesh = xs.HybridMesh(ici_mesh_shape=ici_mesh_shape, dcn_mesh_shape=dcn_mesh_shape, axis_names=('dcn', 'fsdp', 'tensor'))
+                xs.set_global_mesh(mesh)
+            else:
+                xs.set_global_mesh(xs.Mesh(np.array(range(num_devices)), (num_devices, 1), axis_names=("fsdp", "tensor")))
 
     def _activate_neftune(self, model):
         r"""
