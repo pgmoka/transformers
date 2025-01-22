@@ -22,6 +22,7 @@
 import math
 import warnings
 from typing import List, Optional, Tuple, Union
+import os
 
 import torch
 import torch.nn.functional as F
@@ -60,6 +61,8 @@ import torch_xla.debug.profiler as xp
 logger = logging.get_logger(__name__)
 
 _CONFIG_FOR_DOC = "LlamaConfig"
+
+NUM_TPU_SLICE = int(os.environ.get('NUM_TPU_SLICE', 1))
 
 
 def _get_unpad_data(attention_mask):
@@ -387,7 +390,10 @@ class LlamaAttention(nn.Module):
             # Integrated with PyTorch/XLA Pallas Flash Attention:
             from torch_xla.experimental.custom_kernel import flash_attention
             query_states /= math.sqrt(self.head_dim)
-            attn_output = flash_attention(query_states, key_states, value_states, causal=True, partition_spec=('fsdp', 'tensor', None, None))
+            if NUM_TPU_SLICE > 1:
+                attn_output = flash_attention(query_states, key_states, value_states, causal=True, partition_spec=(('dcn', 'fsdp'), 'tensor', None, None))
+            else:
+                attn_output = flash_attention(query_states, key_states, value_states, causal=True, partition_spec=('fsdp', 'tensor', None, None))
 
         if attn_output.size() != (bsz, self.num_heads, q_len, self.head_dim):
             raise ValueError(

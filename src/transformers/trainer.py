@@ -1717,7 +1717,10 @@ class Trainer:
 
                     if real_output is None:
                         raise ValueError("Something went wrong, the output of the model shouldn't be `None`")
-                    xs.mark_sharding(real_output, mesh, ("fsdp", None, None))
+                    if NUM_TPU_SLICE > 1:
+                        xs.mark_sharding(real_output, mesh, (("dcn", "fsdp"), None, None))
+                    else:
+                        xs.mark_sharding(real_output, mesh, ("fsdp", None, None))
 
                 self.model = model = FSDPv2(
                     model,
