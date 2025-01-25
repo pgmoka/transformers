@@ -25,7 +25,7 @@ mkdir -p xla_dumps/scan-offload-ptxla
 export XLA_IR_DEBUG=1
 export XLA_HLO_DEBUG=1
 export PROFILE_EPOCH=0
-export PROFILE_STEP=1
+export PROFILE_STEP=4
 export PROFILE_DURATION_MS=20000
 export PROFILE_LOGDIR=/workspaces/torch/profile/scan-offload-ptxla
 
