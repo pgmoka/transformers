@@ -791,6 +791,7 @@ def main():
         # Initialize ptxla megascale
         torch_xla._XLAC._init_computation_client()
         # Disable jax megascale
+        os.environ['SKIP_MEGASCALE_PJRT_CLIENT'] = 'true'
         os.environ['USE_SINGLE_SLICE'] = 'true'
         train_result = trainer.train(resume_from_checkpoint=checkpoint)
         trainer.save_model()  # Saves the tokenizer too for easy upload
